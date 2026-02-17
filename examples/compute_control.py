@@ -136,8 +136,8 @@ def _plot_control_solution(
         color="#9aa6b2",
     )
     ax.plot(traj[:, 0], traj[:, 1], lw=2.2, color="#005f73", label="Optimal trajectory")
-    ax.scatter(x0[0].item(), x0[1].item(), s=80, marker="o", color="#005f73", label="Initial")
-    ax.scatter(target[0].item(), target[1].item(), s=140, marker="*", color="#ca6702", label="Target")
+    ax.scatter(x0[0].item(), x0[1].item(), s=80, marker="o", color="#1f2933", label="Initial")
+    ax.scatter(target[0].item(), target[1].item(), s=140, marker="*", color="#ee9b00", label="Target")
     ax.scatter(poles, np.zeros_like(poles), s=120, facecolors="none", edgecolors="black", linewidths=1.2)
 
     if force_points.shape[0] > 0:

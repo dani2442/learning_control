@@ -33,6 +33,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--iters", type=int, default=500)
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--plot", default=True, action="store_true")
+    parser.add_argument("--force-step", type=int, default=3)
     parser.add_argument("--image-dir", type=str, default="images")
     return parser.parse_args()
 
@@ -56,6 +57,7 @@ def main() -> None:
         dt=dt,
         steps=args.iters,
     )
+    real_force_gain = (float(system_config.control_gain_x), float(system_config.control_gain_y))
 
     rollout_real = partial(rollout_real_dynamics, system_config=system_config)
     rollout_learned = partial(rollout_learned_dynamics, model)
@@ -91,6 +93,10 @@ def main() -> None:
             learned_opt_traj=traj_learned_opt_on_real.cpu(),
             target=target.cpu(),
             initial=x0.cpu(),
+            controls_true=controls_real_opt.cpu(),
+            controls_learned=controls_learned_opt.cpu(),
+            force_gain=real_force_gain,
+            force_step=args.force_step,
             config=system_config,
             save_path=Path(args.image_dir) / "optimal_control_comparison.pdf",
         )

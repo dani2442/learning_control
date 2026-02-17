@@ -18,30 +18,23 @@ class VortexSystemConfig:
     eps: float = 1e-3
     control_gain_x: float = 0.05
     control_gain_y: float = 0.5
-    diffusion: float = 0.08
+    diffusion: float = 0.0
 
 
 @dataclass(frozen=True)
-class RandomControlBasisConfig:
-    basis: str = "sinusoidal"
-    num_terms: int = 3
-    amplitude_range: tuple[float, float] = (0.2, 0.8)
+class RandomSinusoidalControlConfig:
+    amplitude: float = 0.6
     frequency_range: tuple[float, float] = (0.4, 2.0)
     phase_range: tuple[float, float] = (0.0, 2.0 * math.pi)
-    coefficient_scale: float = 0.6
-    bias_range: tuple[float, float] = (-0.2, 0.2)
+    bias: float = 0.0
 
 
-ControlFn = Callable[[Tensor, Tensor], Tensor]
+ControlFn = Callable[[Tensor], Tensor | float]
 
 
-def default_control_fn(t: Tensor, x: Tensor) -> Tensor:
-    """Baseline control policy used to generate the training dataset."""
-    t = t.to(dtype=x.dtype, device=x.device)
-    if t.ndim == 0:
-        t = t.expand(x.shape[0])
-    u = 0.6 * torch.sin(0.7 * t) + 0.15 * x[:, 0] - 0.25 * x[:, 1]
-    return u.unsqueeze(-1)
+def default_control_fn(t: Tensor) -> Tensor:
+    """Default time-only control used to generate the training dataset."""
+    return 0.6 * torch.sin(0.7 * t)
 
 
 def _validate_range(name: str, bounds: tuple[float, float]) -> None:
@@ -49,117 +42,118 @@ def _validate_range(name: str, bounds: tuple[float, float]) -> None:
         raise ValueError(f"{name} must satisfy low <= high, got {bounds}.")
 
 
-def make_random_basis_control_fn(
+def _make_generator(
+    *,
+    seed: int | None,
+    generator: torch.Generator | None,
+    device: str,
+) -> torch.Generator:
+    if generator is not None and seed is not None:
+        raise ValueError("Provide either seed or generator, not both.")
+    if generator is not None:
+        return generator
+    local_generator = torch.Generator(device=device)
+    if seed is not None:
+        local_generator.manual_seed(seed)
+    return local_generator
+
+
+def _as_control_tensor(
+    control_value: Tensor | float,
+    *,
+    batch_size: int,
+    reference: Tensor,
+) -> Tensor:
+    if isinstance(control_value, Tensor):
+        u = control_value.to(dtype=reference.dtype, device=reference.device)
+    else:
+        u = torch.tensor(control_value, dtype=reference.dtype, device=reference.device)
+
+    if u.ndim == 0:
+        return u.expand(batch_size, 1)
+
+    if u.ndim == 1:
+        if u.shape[0] == 1:
+            return u.expand(batch_size).unsqueeze(-1)
+        if u.shape[0] == batch_size:
+            return u.unsqueeze(-1)
+
+    if u.ndim == 2 and u.shape[1] == 1:
+        if u.shape[0] == 1:
+            return u.expand(batch_size, 1)
+        if u.shape[0] == batch_size:
+            return u
+
+    raise ValueError(
+        "Control output must be scalar, shape (1,), (batch,), (1, 1), or (batch, 1); "
+        f"got {tuple(u.shape)} for batch={batch_size}."
+    )
+
+
+def make_random_sinusoidal_control_fn(
     *,
     num_trajectories: int,
-    horizon: float,
-    config: RandomControlBasisConfig | None = None,
+    config: RandomSinusoidalControlConfig | None = None,
     seed: int | None = None,
     generator: torch.Generator | None = None,
     device: str = "cpu",
 ) -> tuple[ControlFn, dict[str, object]]:
-    """
-    Build a random per-trajectory control policy from a selected basis.
-
-    Supported bases:
-    - sinusoidal: sum_j a_j * sin(2*pi*f_j*t + phi_j) + b
-    - polynomial: sum_j c_j * (t / horizon)^j + b
-    """
-    cfg = config or RandomControlBasisConfig()
+    """Build u_control(t) = A * sin(2*pi*f*t + phase) + b with random f and phase."""
+    cfg = config or RandomSinusoidalControlConfig()
     if num_trajectories <= 0:
         raise ValueError(f"num_trajectories must be positive, got {num_trajectories}.")
-    if cfg.num_terms <= 0:
-        raise ValueError(f"num_terms must be positive, got {cfg.num_terms}.")
-    if horizon <= 0.0:
-        raise ValueError(f"horizon must be positive, got {horizon}.")
 
-    supported_bases = {"sinusoidal", "polynomial"}
-    if cfg.basis not in supported_bases:
-        raise ValueError(f"Unsupported basis '{cfg.basis}'. Supported bases: {sorted(supported_bases)}.")
-
-    _validate_range("amplitude_range", cfg.amplitude_range)
     _validate_range("frequency_range", cfg.frequency_range)
     _validate_range("phase_range", cfg.phase_range)
-    _validate_range("bias_range", cfg.bias_range)
-
-    local_generator = generator
-    if local_generator is None:
-        local_generator = torch.Generator(device=device)
-        if seed is not None:
-            local_generator.manual_seed(seed)
-    elif seed is not None:
-        raise ValueError("Provide either seed or generator, not both.")
+    local_generator = _make_generator(seed=seed, generator=generator, device=device)
 
     sample_device = torch.device(device)
-    basis_kind = cfg.basis
+    frequencies = torch.empty((num_trajectories,), device=sample_device)
+    phases = torch.empty((num_trajectories,), device=sample_device)
+    frequencies.uniform_(cfg.frequency_range[0], cfg.frequency_range[1], generator=local_generator)
+    phases.uniform_(cfg.phase_range[0], cfg.phase_range[1], generator=local_generator)
 
-    bias = torch.empty((num_trajectories,), device=sample_device)
-    bias.uniform_(cfg.bias_range[0], cfg.bias_range[1], generator=local_generator)
-
-    if basis_kind == "sinusoidal":
-        amplitudes = torch.empty((num_trajectories, cfg.num_terms), device=sample_device)
-        frequencies = torch.empty((num_trajectories, cfg.num_terms), device=sample_device)
-        phases = torch.empty((num_trajectories, cfg.num_terms), device=sample_device)
-
-        amplitudes.uniform_(cfg.amplitude_range[0], cfg.amplitude_range[1], generator=local_generator)
-        frequencies.uniform_(cfg.frequency_range[0], cfg.frequency_range[1], generator=local_generator)
-        phases.uniform_(cfg.phase_range[0], cfg.phase_range[1], generator=local_generator)
-
-        def control_fn(t: Tensor, x: Tensor) -> Tensor:
-            t = t.to(dtype=x.dtype, device=x.device)
-            if t.ndim == 0:
-                t = t.expand(x.shape[0])
-            if t.shape[0] != x.shape[0]:
-                raise ValueError(f"Expected t to have shape ({x.shape[0]},) or scalar, got {tuple(t.shape)}.")
-
-            amp = amplitudes.to(device=x.device, dtype=x.dtype)
-            freq = frequencies.to(device=x.device, dtype=x.dtype)
-            phase = phases.to(device=x.device, dtype=x.dtype)
-            bias_local = bias.to(device=x.device, dtype=x.dtype)
-
-            angle = 2.0 * math.pi * t.unsqueeze(-1) * freq + phase
-            u = torch.sum(amp * torch.sin(angle), dim=-1) + bias_local
-            return u.unsqueeze(-1)
-
-        control_meta: dict[str, object] = {
-            "type": "random_basis",
-            "basis": basis_kind,
-            "num_terms": cfg.num_terms,
-            "amplitude_range": cfg.amplitude_range,
-            "frequency_range": cfg.frequency_range,
-            "phase_range": cfg.phase_range,
-            "bias_range": cfg.bias_range,
-            "seed": seed,
-        }
-        return control_fn, control_meta
-
-    coefficients = torch.empty((num_trajectories, cfg.num_terms), device=sample_device)
-    coefficients.uniform_(-cfg.coefficient_scale, cfg.coefficient_scale, generator=local_generator)
-    powers = torch.arange(cfg.num_terms, device=sample_device, dtype=torch.float32)
-
-    def control_fn(t: Tensor, x: Tensor) -> Tensor:
-        t = t.to(dtype=x.dtype, device=x.device)
-        if t.ndim == 0:
-            t = t.expand(x.shape[0])
-        if t.shape[0] != x.shape[0]:
-            raise ValueError(f"Expected t to have shape ({x.shape[0]},) or scalar, got {tuple(t.shape)}.")
-
-        coeff = coefficients.to(device=x.device, dtype=x.dtype)
-        powers_local = powers.to(device=x.device, dtype=x.dtype)
-        bias_local = bias.to(device=x.device, dtype=x.dtype)
-
-        tau = torch.clamp(t / float(horizon), min=0.0, max=1.0)
-        features = tau.unsqueeze(-1).pow(powers_local)
-        u = torch.sum(coeff * features, dim=-1) + bias_local
+    def control_fn(t: Tensor) -> Tensor:
+        time = t.to(dtype=frequencies.dtype, device=frequencies.device)
+        if time.ndim == 0:
+            time = time.expand(num_trajectories)
+        elif time.ndim == 1 and time.shape[0] == 1:
+            time = time.expand(num_trajectories)
+        elif time.ndim != 1 or time.shape[0] != num_trajectories:
+            raise ValueError(
+                f"Expected t to be scalar or shape ({num_trajectories},), got {tuple(time.shape)}."
+            )
+        u = cfg.amplitude * torch.sin(2.0 * math.pi * frequencies * time + phases) + cfg.bias
         return u.unsqueeze(-1)
 
-    control_meta = {
-        "type": "random_basis",
-        "basis": basis_kind,
-        "num_terms": cfg.num_terms,
-        "coefficient_scale": cfg.coefficient_scale,
-        "bias_range": cfg.bias_range,
+    control_meta: dict[str, object] = {
+        "type": "sinusoidal",
+        "amplitude": cfg.amplitude,
+        "frequency_range": cfg.frequency_range,
+        "phase_range": cfg.phase_range,
+        "bias": cfg.bias,
         "seed": seed,
+    }
+    return control_fn, control_meta
+
+
+def make_constant_control_fn(
+    *,
+    num_trajectories: int,
+    value: float = 0.0,
+    device: str = "cpu",
+) -> tuple[ControlFn, dict[str, object]]:
+    if num_trajectories <= 0:
+        raise ValueError(f"num_trajectories must be positive, got {num_trajectories}.")
+    constants = torch.full((num_trajectories, 1), float(value), device=device)
+
+    def control_fn(t: Tensor) -> Tensor:
+        time = t if isinstance(t, Tensor) else torch.tensor(t, device=constants.device)
+        return constants.to(dtype=time.dtype, device=time.device)
+
+    control_meta: dict[str, object] = {
+        "type": "constant",
+        "value": float(value),
     }
     return control_fn, control_meta
 
@@ -190,10 +184,10 @@ def rollout_controlled_system(
     times: Tensor,
     control_fn: ControlFn,
     config: VortexSystemConfig,
-    stochastic: bool = True,
+    stochastic: bool = False,
     generator: torch.Generator | None = None,
 ) -> tuple[Tensor, Tensor]:
-    """Euler-Maruyama rollout for many trajectories in parallel."""
+    """Euler rollout for many trajectories in parallel."""
     states = [initial_states]
     controls: list[Tensor] = []
 
@@ -203,10 +197,10 @@ def rollout_controlled_system(
 
     for step in range(times.numel() - 1):
         t = times[step]
-        u_t = control_fn(t, x_t)
+        u_t = _as_control_tensor(control_fn(t), batch_size=x_t.shape[0], reference=x_t)
         drift = controlled_vortex_drift(x_t, u_t, config)
 
-        if stochastic:
+        if stochastic and config.diffusion != 0.0:
             noise = torch.randn(
                 x_t.shape,
                 dtype=x_t.dtype,
@@ -252,7 +246,7 @@ def generate_dataset(
         times=times,
         control_fn=control_fn,
         config=cfg,
-        stochastic=True,
+        stochastic=False,
         generator=generator,
     )
 

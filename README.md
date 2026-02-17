@@ -1,10 +1,10 @@
-# Learning Control with Neural SDE
+# Learning Control with Neural Dynamics
 
 Learn a controlled nonlinear flow from trajectory data, then solve and compare open-loop optimal control on:
 1. the known physical dynamics, and
-2. the learned Neural SDE surrogate.
+2. the learned neural surrogate.
 
-Built with `PyTorch` + `torchsde`.
+Built with `PyTorch`.
 
 ## System We Model
 
@@ -29,21 +29,19 @@ Default parameters:
 - `k_x = 0.05`, `k_y = 0.5`
 - `epsilon = 1e-3`
 
-Training data is generated with Euler-Maruyama:
+Training data is generated with deterministic Euler integration:
 
 ```math
-X_{k+1} = X_k + \Delta t\, f(X_k, u_k) + \sigma \sqrt{\Delta t}\,\xi_k,\quad \xi_k \sim \mathcal{N}(0, I)
+X_{k+1} = X_k + \Delta t\, f(X_k, u_k)
 ```
 
-where `sigma = 0.08` by default.
+Real-system noise is set to zero by default (`diffusion = 0.0`).
 
-The learned model is a controlled Ito Neural SDE:
+The learned model is drift-only (no learned diffusion):
 
 ```math
-dX_t = \big(f_\theta(X_t, t) + B u_t\big)\,dt + g_\theta(X_t, t)\,dW_t
+dX_t = \big(f_\theta(X_t, t) + B u_t\big)\,dt
 ```
-
-with diagonal diffusion (`noise_type="diagonal"`).
 
 ## Installation
 
@@ -64,17 +62,31 @@ pip install -e .
 ## Quickstart
 
 ### 1) Generate data
+Random sinusoidal control (`u_control(t)` with random frequency and phase):
 ```bash
 .venv/bin/python examples/generate_data.py \
   --output data/controlled_vortex.pt \
   --num-trajectories 512 \
   --horizon 4.0 \
   --dt 0.05 \
-  --control-basis sinusoidal \
-  --basis-terms 3
+  --control-type sinusoidal \
+  --sin-amplitude 0.6 \
+  --sin-freq-range 0.4 2.0 \
+  --sin-phase-range 0.0 6.283185307
 ```
 
-### 2) Train Neural SDE
+Constant control (`u_control(t) = c`, modifiable with `--constant-value`):
+```bash
+.venv/bin/python examples/generate_data.py \
+  --output data/controlled_vortex_constant.pt \
+  --num-trajectories 512 \
+  --horizon 4.0 \
+  --dt 0.05 \
+  --control-type constant \
+  --constant-value 0.2
+```
+
+### 2) Train neural dynamics model
 ```bash
 .venv/bin/python examples/train_model.py \
   --dataset data/controlled_vortex.pt \
@@ -116,7 +128,7 @@ payload = generate_dataset(num_trajectories=128, horizon=2.0, dt=0.05, seed=7)
 dataset = ControlledTrajectoryDataset(payload)
 loader = DataLoader(dataset, batch_size=32, shuffle=True)
 
-# 2) Train a controlled Neural SDE.
+# 2) Train a controlled drift-only model.
 model = ControlledNeuralSDE(hidden_dim=64)
 cfg = TrainingConfig(epochs=10, lr=1e-3, solver_dt=0.05)
 history = train_neural_sde(
@@ -133,7 +145,7 @@ print("final_train_loss:", history["train_loss"][-1])
 ## Repository Layout
 
 - `src/dataset.py`: dynamics, control policies, rollout, dataset IO
-- `src/model.py`: controlled Neural SDE, training, checkpoint IO
+- `src/model.py`: controlled neural dynamics model, training, checkpoint IO
 - `src/control.py`: open-loop optimal control on real/learned dynamics
 - `src/visualization.py`: stream plots, trajectory comparison, error maps
 - `examples/generate_data.py`: dataset generation CLI

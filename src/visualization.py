@@ -131,6 +131,10 @@ def plot_control_comparison(
     learned_opt_traj: Tensor,
     target: Tensor,
     initial: Tensor,
+    controls_true: Tensor | None = None,
+    controls_learned: Tensor | None = None,
+    force_gain: tuple[float, float] | None = None,
+    force_step: int = 3,
     config: VortexSystemConfig | None = None,
     grid_size: int = 220,
     control_u: float = 0.0,
@@ -141,15 +145,22 @@ def plot_control_comparison(
     initial_np = initial.detach().cpu().numpy()
     target_np = target.detach().cpu().numpy()
 
-    fig, ax = plt.subplots(figsize=(8, 3.5))
-    x_min = min(true_np[:, 0].min(), learned_np[:, 0].min(), float(initial_np[0]), float(target_np[0])) - 1.0
-    x_max = max(true_np[:, 0].max(), learned_np[:, 0].max(), float(initial_np[0]), float(target_np[0])) + 1.0
-    y_min = min(true_np[:, 1].min(), learned_np[:, 1].min(), float(initial_np[1]), float(target_np[1])) - 1.0
-    y_max = max(true_np[:, 1].max(), learned_np[:, 1].max(), float(initial_np[1]), float(target_np[1])) + 1.0
+    true_traj_color = "#005f73"
+    learned_traj_color = "#bb3e03"
+    initial_color = "#1f2933"
+    target_color = "#ee9b00"
+    true_force_color = "#0a9396"
+    learned_force_color = "#ae2012"
+
+    fig, ax = plt.subplots(figsize=(9, 4.8))
+    x_min = float(min(true_np[:, 0].min(), learned_np[:, 0].min(), float(initial_np[0]), float(target_np[0])) - 1.0)
+    x_max = float(max(true_np[:, 0].max(), learned_np[:, 0].max(), float(initial_np[0]), float(target_np[0])) + 1.0)
+    y_min = float(min(true_np[:, 1].min(), learned_np[:, 1].min(), float(initial_np[1]), float(target_np[1])) - 1.0)
+    y_max = float(max(true_np[:, 1].max(), learned_np[:, 1].max(), float(initial_np[1]), float(target_np[1])) + 1.0)
 
     if config is not None:
-        x_min = min(x_min, min(config.poles) - 1.0)
-        x_max = max(x_max, max(config.poles) + 1.0)
+        x_min = float(min(x_min, min(config.poles) - 1.0))
+        x_max = float(max(x_max, max(config.poles) + 1.0))
         x_grid, y_grid, u_field, v_field, mask = _vortex_stream_field(
             config=config,
             xlim=(x_min, x_max),
@@ -169,16 +180,70 @@ def plot_control_comparison(
         )
         ax.scatter(config.poles, np.zeros(len(config.poles)), s=180, facecolors="none", edgecolors="black", linewidths=1.4)
 
-    ax.plot(true_np[:, 0], true_np[:, 1], label="Optimized on real", lw=2)
-    ax.plot(learned_np[:, 0], learned_np[:, 1], label="Optimized on learned", lw=2)
-    ax.scatter(initial_np[0], initial_np[1], marker="o", s=70, label="Initial")
-    ax.scatter(target_np[0], target_np[1], marker="*", s=120, label="Target")
+    ax.plot(true_np[:, 0], true_np[:, 1], label="Optimized on real", lw=2.2, color=true_traj_color)
+    ax.plot(learned_np[:, 0], learned_np[:, 1], label="Optimized on learned", lw=2.2, color=learned_traj_color)
+    ax.scatter(initial_np[0], initial_np[1], marker="o", s=80, color=initial_color, label="Initial")
+    ax.scatter(target_np[0], target_np[1], marker="*", s=140, color=target_color, label="Target")
+
+    if controls_true is not None and controls_learned is not None and force_gain is not None:
+        stride = max(1, force_step)
+
+        def _force_samples(traj_np: np.ndarray, controls_t: Tensor) -> tuple[np.ndarray, np.ndarray]:
+            controls_np = controls_t.detach().cpu().numpy().reshape(-1)
+            usable = min(controls_np.shape[0], traj_np.shape[0] - 1)
+            if usable <= 0:
+                return np.empty((0, 2), dtype=float), np.empty((0, 2), dtype=float)
+            controls_np = controls_np[:usable]
+            force_vecs = np.column_stack((force_gain[0] * controls_np, force_gain[1] * controls_np))
+            return traj_np[:usable:stride], force_vecs[::stride]
+
+        true_force_points, true_force_vecs = _force_samples(true_np, controls_true)
+        learned_force_points, learned_force_vecs = _force_samples(learned_np, controls_learned)
+
+        max_force = 0.0
+        if true_force_vecs.size:
+            max_force = max(max_force, float(np.max(np.linalg.norm(true_force_vecs, axis=1))))
+        if learned_force_vecs.size:
+            max_force = max(max_force, float(np.max(np.linalg.norm(learned_force_vecs, axis=1))))
+        if max_force > 1e-12:
+            scale = 0.7 / max_force
+            true_force_vecs = true_force_vecs * scale
+            learned_force_vecs = learned_force_vecs * scale
+
+        if true_force_points.shape[0] > 0:
+            ax.quiver(
+                true_force_points[:, 0],
+                true_force_points[:, 1],
+                true_force_vecs[:, 0],
+                true_force_vecs[:, 1],
+                color=true_force_color,
+                alpha=0.95,
+                angles="xy",
+                scale_units="xy",
+                scale=1.0,
+                width=0.005,
+                label="Control force (real-opt, scaled)",
+            )
+        if learned_force_points.shape[0] > 0:
+            ax.quiver(
+                learned_force_points[:, 0],
+                learned_force_points[:, 1],
+                learned_force_vecs[:, 0],
+                learned_force_vecs[:, 1],
+                color=learned_force_color,
+                alpha=0.9,
+                angles="xy",
+                scale_units="xy",
+                scale=1.0,
+                width=0.005,
+                label="Control force (learned-opt, scaled)",
+            )
     ax.set_xlabel("x")
     ax.set_ylabel("y")
     ax.set_xlim(x_min, x_max)
     ax.set_ylim(y_min, y_max)
     ax.set_aspect("equal", adjustable="box")
-    ax.legend()
+    ax.legend(loc="best")
     plt.tight_layout()
     _finalize_plot(fig, save_path)
 
@@ -192,6 +257,7 @@ def plot_vector_field_error_map(
     grid_size: int = 150,
     t_value: float = 0.0,
     control_u: float = 0.0,
+    error_vmax: float | None = None,
     device: str = "cpu",
     save_path: str | Path | None = None,
 ) -> None:
@@ -216,6 +282,7 @@ def plot_vector_field_error_map(
         extent=(xlim[0], xlim[1], ylim[0], ylim[1]),
         aspect="equal",
         cmap="magma",
+        vmax=error_vmax,
     )
     ax.scatter(config.poles, np.zeros(len(config.poles)), s=120, facecolors="none", edgecolors="white", linewidths=1.2)
     ax.set_xlabel("x")

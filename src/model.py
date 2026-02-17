@@ -6,7 +6,6 @@ from typing import Callable, Mapping
 
 import torch
 import torch.nn as nn
-import torchsde
 from torch import Tensor
 from torch.utils.data import DataLoader
 
@@ -33,7 +32,7 @@ class ControlledNeuralSDE(nn.Module):
         state_dim: int = 2,
         control_dim: int = 1,
         hidden_dim: int = 64,
-        min_diffusion: float = 1e-3,
+        min_diffusion: float = 0.0,
     ) -> None:
         super().__init__()
         self.state_dim = state_dim
@@ -121,8 +120,8 @@ class ControlledNeuralSDE(nn.Module):
         return base_drift + control_term
 
     def diffusion_with_control(self, t: Tensor, y: Tensor) -> Tensor:
-        features = self._prepare_features(t=t, y=y)
-        return self.min_diffusion + self.diffusion_net(features)
+        # Deterministic setting: learned diffusion is disabled.
+        return torch.zeros_like(y)
 
     def f(self, t: Tensor, y: Tensor) -> Tensor:
         u = self._control_from_trajectory(t, y)
@@ -130,6 +129,24 @@ class ControlledNeuralSDE(nn.Module):
 
     def g(self, t: Tensor, y: Tensor) -> Tensor:
         return self.diffusion_with_control(t=t, y=y)
+
+
+def _rollout_deterministic(
+    model: ControlledNeuralSDE,
+    x0: Tensor,
+    times: Tensor,
+    controls: Tensor,
+) -> Tensor:
+    x_t = x0
+    traj = [x_t]
+    for step in range(times.shape[0] - 1):
+        t = times[step]
+        dt = times[step + 1] - times[step]
+        u_t = controls[:, step, :]
+        drift = model.drift_with_control(t=t, y=x_t, u=u_t)
+        x_t = x_t + dt * drift
+        traj.append(x_t)
+    return torch.stack(traj, dim=1)
 
 
 def train_neural_sde(
@@ -170,24 +187,12 @@ def train_neural_sde(
                         f"Invalid controls shape {controls.shape}; expected T or T-1 with T={times.shape[0]}"
                     )
 
-            model.set_control_trajectory(times=times, controls=controls)
-
-            bm = torchsde.BrownianInterval(
-                t0=float(times[0]),
-                t1=float(times[-1]),
-                size=(states.shape[0], states.shape[-1]),
-                dtype=states.dtype,
-                device=device,
+            preds = _rollout_deterministic(
+                model=model,
+                x0=x0,
+                times=times,
+                controls=controls,
             )
-            preds = torchsde.sdeint(
-                sde=model,
-                y0=x0,
-                ts=times,
-                bm=bm,
-                method=config.method,
-                dt=config.solver_dt,
-            )
-            preds = preds.transpose(0, 1)
 
             loss = torch.mean((preds - states) ** 2)
 
@@ -196,7 +201,6 @@ def train_neural_sde(
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config.grad_clip)
             optimizer.step()
 
-            model.clear_control_trajectory()
             running += float(loss.item())
 
         epoch_loss = running / max(len(dataloader), 1)
@@ -249,27 +253,14 @@ def evaluate_neural_sde(
                     f"Invalid controls shape {controls.shape}; expected T or T-1 with T={times.shape[0]}"
                 )
 
-        model.set_control_trajectory(times=times, controls=controls)
-
-        bm = torchsde.BrownianInterval(
-            t0=float(times[0]),
-            t1=float(times[-1]),
-            size=(states.shape[0], states.shape[-1]),
-            dtype=states.dtype,
-            device=device,
+        preds = _rollout_deterministic(
+            model=model,
+            x0=x0,
+            times=times,
+            controls=controls,
         )
-        preds = torchsde.sdeint(
-            sde=model,
-            y0=x0,
-            ts=times,
-            bm=bm,
-            method=config.method,
-            dt=config.solver_dt,
-        )
-        preds = preds.transpose(0, 1)
 
         loss = torch.mean((preds - states) ** 2)
-        model.clear_control_trajectory()
         running += float(loss.item())
 
     return running / max(len(dataloader), 1)
@@ -331,7 +322,7 @@ def _infer_model_config(
     state_dim = state_from_matrix or state_from_output or int(cfg.get("state_dim", 2))
     control_dim = control_from_matrix or int(cfg.get("control_dim", 1))
     hidden_dim = hidden_from_weight or int(cfg.get("hidden_dim", 64))
-    min_diffusion = float(cfg.get("min_diffusion", 1e-3))
+    min_diffusion = float(cfg.get("min_diffusion", 0.0))
 
     return {
         "state_dim": state_dim,
