@@ -18,14 +18,14 @@ from src.control import (
     rollout_real_dynamics,
     terminal_error,
 )
-from src.dataset import config_from_payload, load_dataset
+from src.dataset import add_control_type_to_path, config_from_payload, control_type_from_payload, load_dataset
 from src.model import load_checkpoint
 from src.visualization import plot_control_comparison
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Compare optimal controls from real vs learned dynamics.")
-    parser.add_argument("--dataset", type=str, default="data/controlled_vortex.pt")
+    parser.add_argument("--dataset", type=str, default="data/controlled_vortex_constant.pt")
     parser.add_argument("--checkpoint", type=str, default="data/neural_sde.pt")
     parser.add_argument("--x0", type=float, nargs=2, default=(-3.0, 1.2))
     parser.add_argument("--target", type=float, nargs=2, default=(2.5, -0.8))
@@ -43,10 +43,12 @@ def main() -> None:
     device = args.device
 
     payload = load_dataset(args.dataset)
+    control_type = control_type_from_payload(payload)
     system_config = config_from_payload(payload)
     dt = float(payload["times"][1] - payload["times"][0])
 
-    model, _ = load_checkpoint(args.checkpoint, device=device)
+    checkpoint_path = add_control_type_to_path(args.checkpoint, control_type)
+    model, _ = load_checkpoint(checkpoint_path, device=device)
     model.eval()
 
     x0 = torch.tensor(args.x0, dtype=torch.float32, device=device)
@@ -88,6 +90,7 @@ def main() -> None:
     print(f"- optimize on learned, evaluate on real:   {terminal_error(traj_learned_opt_on_real, target):.4f}")
 
     if args.plot:
+        plot_path = add_control_type_to_path(Path(args.image_dir) / "optimal_control_comparison.pdf", control_type)
         plot_control_comparison(
             true_opt_traj=traj_real_opt_on_real.cpu(),
             learned_opt_traj=traj_learned_opt_on_real.cpu(),
@@ -98,7 +101,7 @@ def main() -> None:
             force_gain=real_force_gain,
             force_step=args.force_step,
             config=system_config,
-            save_path=Path(args.image_dir) / "optimal_control_comparison.pdf",
+            save_path=plot_path,
         )
 
 

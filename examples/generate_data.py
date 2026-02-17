@@ -15,7 +15,9 @@ if str(ROOT) not in sys.path:
 
 from src.dataset import (
     RandomSinusoidalControlConfig,
+    add_control_type_to_path,
     config_from_payload,
+    control_type_from_payload,
     generate_dataset,
     make_constant_control_fn,
     make_random_sinusoidal_control_fn,
@@ -38,14 +40,14 @@ def load_control_fn(spec: str) -> Callable[[Tensor], Tensor | float]:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generate controlled trajectory dataset.")
     parser.add_argument("--output", type=str, default="data/controlled_vortex.pt")
-    parser.add_argument("--num-trajectories", type=int, default=512)
+    parser.add_argument("--num-trajectories", type=int, default=128)
     parser.add_argument("--horizon", type=float, default=4.0)
     parser.add_argument("--dt", type=float, default=0.05)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument(
         "--control-type",
         choices=("sinusoidal", "constant", "custom"),
-        default="sinusoidal",
+        default="constant",
         help="Control example to use.",
     )
     parser.add_argument(
@@ -58,7 +60,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sin-freq-range", type=float, nargs=2, default=(0.4, 2.0))
     parser.add_argument("--sin-phase-range", type=float, nargs=2, default=(0.0, 2.0 * math.pi))
     parser.add_argument("--sin-bias", type=float, default=0.0)
-    parser.add_argument("--constant-value", type=float, default=0.0)
+    parser.add_argument(
+        "--constant-value",
+        type=float,
+        nargs="+",
+        default=[-1., 0.0, 1.0],
+        help="One or more constant control values. If multiple are provided, one is sampled per trajectory.",
+    )
     parser.add_argument("--plot", default=True, action="store_true")
     parser.add_argument("--max-lines", type=int, default=60)
     parser.add_argument("--image-dir", type=str, default="images")
@@ -89,6 +97,7 @@ def main() -> None:
         control_fn, control_meta = make_constant_control_fn(
             num_trajectories=args.num_trajectories,
             value=args.constant_value,
+            seed=args.seed,
         )
 
     payload = generate_dataset(
@@ -99,13 +108,15 @@ def main() -> None:
         control_fn=control_fn,
     )
     payload["control"] = control_meta
-    save_dataset(payload, args.output)
+    control_type = control_type_from_payload(payload, default=args.control_type)
+    output_path = add_control_type_to_path(args.output, control_type)
+    save_dataset(payload, output_path)
 
     states = payload["states"]
     controls = payload["controls"]
     times = payload["times"]
 
-    print(f"saved={args.output}")
+    print(f"saved={output_path}")
     print(f"control={control_meta}")
     print(
         f"states_shape={tuple(states.shape)} controls_shape={tuple(controls.shape)} "
@@ -113,12 +124,13 @@ def main() -> None:
     )
 
     if args.plot:
+        plot_path = add_control_type_to_path(Path(args.image_dir) / "generated_data.pdf", control_type)
         plot_stream_and_trajectories(
             states=states,
             config=config_from_payload(payload),
             title="Generated controlled trajectories over stream field",
             max_lines=args.max_lines,
-            save_path=Path(args.image_dir) / "generated_data.pdf",
+            save_path=plot_path,
         )
 
 

@@ -37,6 +37,36 @@ def default_control_fn(t: Tensor) -> Tensor:
     return 0.6 * torch.sin(0.7 * t)
 
 
+def control_type_from_payload(payload: dict[str, object], *, default: str = "unknown") -> str:
+    control = payload.get("control")
+    if not isinstance(control, dict):
+        return default
+
+    control_type = control.get("type")
+    if isinstance(control_type, str) and control_type.strip():
+        return control_type.strip()
+    return default
+
+
+def control_type_to_filename_tag(control_type: str) -> str:
+    cleaned = "".join(char.lower() if char.isalnum() else "_" for char in control_type.strip())
+    while "__" in cleaned:
+        cleaned = cleaned.replace("__", "_")
+    cleaned = cleaned.strip("_")
+    return cleaned or "unknown"
+
+
+def add_control_type_to_path(path: str | Path, control_type: str) -> Path:
+    path_obj = Path(path)
+    tag = control_type_to_filename_tag(control_type)
+    stem = path_obj.stem if path_obj.suffix else path_obj.name
+    if stem == tag or stem.endswith(f"_{tag}"):
+        return path_obj
+
+    filename = f"{stem}_{tag}{path_obj.suffix}" if path_obj.suffix else f"{stem}_{tag}"
+    return path_obj.with_name(filename)
+
+
 def _validate_range(name: str, bounds: tuple[float, float]) -> None:
     if bounds[0] > bounds[1]:
         raise ValueError(f"{name} must satisfy low <= high, got {bounds}.")
@@ -140,21 +170,48 @@ def make_random_sinusoidal_control_fn(
 def make_constant_control_fn(
     *,
     num_trajectories: int,
-    value: float = 0.0,
+    value: float | list[float] | tuple[float, ...] | Tensor = 0.0,
+    seed: int | None = None,
+    generator: torch.Generator | None = None,
     device: str = "cpu",
 ) -> tuple[ControlFn, dict[str, object]]:
     if num_trajectories <= 0:
         raise ValueError(f"num_trajectories must be positive, got {num_trajectories}.")
-    constants = torch.full((num_trajectories, 1), float(value), device=device)
+    local_generator = _make_generator(seed=seed, generator=generator, device=device)
+
+    if isinstance(value, Tensor):
+        candidates = value.flatten().to(device=device, dtype=torch.float32)
+    elif isinstance(value, (list, tuple)):
+        candidates = torch.tensor(value, device=device, dtype=torch.float32).flatten()
+    else:
+        candidates = torch.tensor([float(value)], device=device, dtype=torch.float32)
+
+    if candidates.numel() == 0:
+        raise ValueError("value must include at least one constant.")
+
+    if candidates.numel() == 1:
+        constants = candidates.expand(num_trajectories).unsqueeze(-1)
+    else:
+        indices = torch.randint(
+            low=0,
+            high=candidates.numel(),
+            size=(num_trajectories,),
+            generator=local_generator,
+            device=torch.device(device),
+        )
+        constants = candidates[indices].unsqueeze(-1)
 
     def control_fn(t: Tensor) -> Tensor:
         time = t if isinstance(t, Tensor) else torch.tensor(t, device=constants.device)
         return constants.to(dtype=time.dtype, device=time.device)
 
-    control_meta: dict[str, object] = {
-        "type": "constant",
-        "value": float(value),
-    }
+    values_list = [float(v) for v in candidates.detach().cpu().tolist()]
+    control_meta: dict[str, object] = {"type": "constant", "values": values_list}
+    if len(values_list) == 1:
+        control_meta["value"] = values_list[0]
+    else:
+        control_meta["assignment"] = "uniform_random_per_trajectory"
+        control_meta["seed"] = seed
     return control_fn, control_meta
 
 

@@ -20,13 +20,19 @@ from src.control import (
     rollout_real_dynamics,
     terminal_error,
 )
-from src.dataset import config_from_payload, controlled_vortex_drift, load_dataset
+from src.dataset import (
+    add_control_type_to_path,
+    config_from_payload,
+    control_type_from_payload,
+    controlled_vortex_drift,
+    load_dataset,
+)
 from src.model import load_checkpoint
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Compute open-loop optimal control sequence.")
-    parser.add_argument("--dataset", type=str, default="data/controlled_vortex.pt")
+    parser.add_argument("--dataset", type=str, default="data/controlled_vortex_constant.pt")
     parser.add_argument("--checkpoint", type=str, default="data/neural_sde.pt")
     parser.add_argument("--dynamics", choices=("real", "learned"), default="real")
     parser.add_argument("--x0", type=float, nargs=2, default=(-3.0, 1.2))
@@ -174,6 +180,7 @@ def main() -> None:
     device = args.device
 
     payload = load_dataset(args.dataset)
+    control_type = control_type_from_payload(payload)
     system_config = config_from_payload(payload)
 
     dt = float(payload["times"][1] - payload["times"][0])
@@ -191,7 +198,8 @@ def main() -> None:
         rollout_fn = partial(rollout_real_dynamics, system_config=system_config)
         force_gain = (system_config.control_gain_x, system_config.control_gain_y)
     else:
-        model, _ = load_checkpoint(args.checkpoint, device=device)
+        checkpoint_path = add_control_type_to_path(args.checkpoint, control_type)
+        model, _ = load_checkpoint(checkpoint_path, device=device)
         model.eval()
         rollout_fn = partial(rollout_learned_dynamics, model)
         force_gain = (float(model.control_matrix[0, 0].item()), float(model.control_matrix[1, 0].item()))
@@ -209,6 +217,10 @@ def main() -> None:
     print(f"control_l2={float(torch.mean(controls.square()).sqrt().item()):.4f}")
 
     if args.plot:
+        plot_path = add_control_type_to_path(
+            Path(args.image_dir) / f"compute_control_{args.dynamics}.pdf",
+            control_type,
+        )
         _plot_control_solution(
             dynamics=args.dynamics,
             trajectory=trajectory,
@@ -221,7 +233,7 @@ def main() -> None:
             grid_size=args.field_grid,
             force_step=args.force_step,
             device=device,
-            save_path=Path(args.image_dir) / f"compute_control_{args.dynamics}.pdf",
+            save_path=plot_path,
         )
 
 

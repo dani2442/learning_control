@@ -12,14 +12,20 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.dataset import ControlledTrajectoryDataset, config_from_payload, load_dataset
+from src.dataset import (
+    ControlledTrajectoryDataset,
+    add_control_type_to_path,
+    config_from_payload,
+    control_type_from_payload,
+    load_dataset,
+)
 from src.model import ControlledNeuralSDE, TrainingConfig, save_checkpoint, train_neural_sde
 from src.visualization import plot_vector_field_error_map
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train controlled neural dynamics model (deterministic drift only).")
-    parser.add_argument("--dataset", type=str, default="data/controlled_vortex.pt")
+    parser.add_argument("--dataset", type=str, default="data/controlled_vortex_constant.pt")
     parser.add_argument("--checkpoint", type=str, default="data/neural_sde.pt")
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch-size", type=int, default=128)
@@ -39,6 +45,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     payload = load_dataset(args.dataset)
+    control_type = control_type_from_payload(payload)
     dataset = ControlledTrajectoryDataset(payload)
     if len(dataset) == 0:
         raise ValueError("Dataset is empty.")
@@ -91,10 +98,11 @@ def main() -> None:
         val_dataloader=val_dataloader,
         device=args.device,
     )
-    save_checkpoint(model, args.checkpoint, config, history)
+    checkpoint_path = add_control_type_to_path(args.checkpoint, control_type)
+    save_checkpoint(model, checkpoint_path, config, history)
 
     print(f"train_size={train_size} val_size={val_size} val_ratio={args.val_ratio:.3f}")
-    print(f"saved={args.checkpoint}")
+    print(f"saved={checkpoint_path}")
     print(f"final_train_loss={history['train_loss'][-1]:.6f}")
     if history["val_loss"]:
         print(f"final_val_loss={history['val_loss'][-1]:.6f}")
@@ -110,6 +118,7 @@ def main() -> None:
         # ylim = (float(torch.min(y_values).item()) - 0.5, float(torch.max(y_values).item()) + 0.5)
 
         model.eval()
+        error_map_path = add_control_type_to_path(Path(args.image_dir) / "train_model_error_map.pdf", control_type)
         plot_vector_field_error_map(
             model=model,
             config=config_from_payload(payload),
@@ -120,7 +129,7 @@ def main() -> None:
             control_u=0.0,
             error_vmax=5.0,
             device=args.device,
-            save_path=Path(args.image_dir) / "train_model_error_map.pdf",
+            save_path=error_map_path,
         )
 
 

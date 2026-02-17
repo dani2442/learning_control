@@ -83,8 +83,9 @@ Constant control (`u_control(t) = c`, modifiable with `--constant-value`):
   --horizon 4.0 \
   --dt 0.05 \
   --control-type constant \
-  --constant-value 0.2
+  --constant-value -1.0 0.0 1.0
 ```
+When multiple values are provided, each trajectory is assigned one value uniformly at random and keeps it for the full rollout.
 
 ### 2) Train neural dynamics model
 ```bash
