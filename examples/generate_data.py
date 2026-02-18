@@ -1,3 +1,5 @@
+"""Generate controlled trajectory datasets."""
+
 from __future__ import annotations
 
 import argparse
@@ -9,18 +11,16 @@ from typing import Callable
 
 from torch import Tensor
 
-ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
+from src.controls import RandomSinusoidalControlConfig, make_constant_control_fn, make_random_sinusoidal_control_fn
 from src.dataset import (
-    RandomSinusoidalControlConfig,
     add_control_type_to_path,
     config_from_payload,
     control_type_from_payload,
     generate_dataset,
-    make_constant_control_fn,
-    make_random_sinusoidal_control_fn,
     save_dataset,
 )
 from src.visualization import plot_stream_and_trajectories
@@ -40,7 +40,7 @@ def load_control_fn(spec: str) -> Callable[[Tensor], Tensor | float]:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generate controlled trajectory dataset.")
     parser.add_argument("--output", type=str, default="data/controlled_vortex.pt")
-    parser.add_argument("--num-trajectories", type=int, default=128)
+    parser.add_argument("--num-trajectories", type=int, default=32)
     parser.add_argument("--horizon", type=float, default=4.0)
     parser.add_argument("--dt", type=float, default=0.05)
     parser.add_argument("--seed", type=int, default=7)
@@ -64,10 +64,15 @@ def parse_args() -> argparse.Namespace:
         "--constant-value",
         type=float,
         nargs="+",
-        default=[-1., 0.0, 1.0],
+        default=[0.0, 1.0],
         help="One or more constant control values. If multiple are provided, one is sampled per trajectory.",
     )
-    parser.add_argument("--plot", default=True, action="store_true")
+    parser.add_argument("--plot", dest="plot", action="store_true")
+    parser.add_argument("--no-plot", dest="plot", action="store_false")
+    parser.set_defaults(plot=True)
+    parser.add_argument("--show-plot", dest="show_plot", action="store_true")
+    parser.add_argument("--no-show-plot", dest="show_plot", action="store_false")
+    parser.set_defaults(show_plot=False)
     parser.add_argument("--max-lines", type=int, default=60)
     parser.add_argument("--image-dir", type=str, default="images")
     return parser.parse_args()
@@ -124,13 +129,14 @@ def main() -> None:
     )
 
     if args.plot:
-        plot_path = add_control_type_to_path(Path(args.image_dir) / "generated_data.pdf", control_type)
+        plot_path = add_control_type_to_path(Path(args.image_dir) / "generated_data.pdf", control_type, as_subdir=True)
         plot_stream_and_trajectories(
             states=states,
             config=config_from_payload(payload),
             title="Generated controlled trajectories over stream field",
             max_lines=args.max_lines,
             save_path=plot_path,
+            show=args.show_plot,
         )
 
 

@@ -1,278 +1,108 @@
+"""Dataset generation, persistence, and loading for controlled trajectory data."""
+
 from __future__ import annotations
 
-import math
-from dataclasses import asdict, dataclass
+from dataclasses import asdict
 from pathlib import Path
 from typing import Callable
 
 import torch
+import torchsde
 from torch import Tensor
 from torch.utils.data import Dataset
 
+from src.controls import ControlFn, _as_control_tensor
+from src.dynamics import VortexSDE, VortexSystemConfig
 
-@dataclass(frozen=True)
-class VortexSystemConfig:
-    background_speed: float = 1.0
-    poles: tuple[float, float, float] = (-2.0, 0.0, 2.0)
-    strengths: tuple[float, float, float] = (1.0, -1.0, 1.0)
-    eps: float = 1e-3
-    control_gain_x: float = 0.05
-    control_gain_y: float = 0.5
-    diffusion: float = 0.0
+# Legacy-compatible type alias (control factories now live in src.controls)
+SimpleControlFn = Callable[[Tensor], Tensor | float]
 
 
-@dataclass(frozen=True)
-class RandomSinusoidalControlConfig:
-    amplitude: float = 0.6
-    frequency_range: tuple[float, float] = (0.4, 2.0)
-    phase_range: tuple[float, float] = (0.0, 2.0 * math.pi)
-    bias: float = 0.0
-
-
-ControlFn = Callable[[Tensor], Tensor | float]
-
-
-def default_control_fn(t: Tensor) -> Tensor:
-    """Default time-only control used to generate the training dataset."""
-    return 0.6 * torch.sin(0.7 * t)
+# ---------------------------------------------------------------------------
+# Path tagging helpers
+# ---------------------------------------------------------------------------
 
 
 def control_type_from_payload(payload: dict[str, object], *, default: str = "unknown") -> str:
+    """Extract the control-type string stored inside a dataset payload."""
     control = payload.get("control")
     if not isinstance(control, dict):
         return default
-
     control_type = control.get("type")
     if isinstance(control_type, str) and control_type.strip():
         return control_type.strip()
     return default
 
 
-def control_type_to_filename_tag(control_type: str) -> str:
-    cleaned = "".join(char.lower() if char.isalnum() else "_" for char in control_type.strip())
+def _sanitise_tag(control_type: str) -> str:
+    cleaned = "".join(c.lower() if c.isalnum() else "_" for c in control_type.strip())
     while "__" in cleaned:
         cleaned = cleaned.replace("__", "_")
-    cleaned = cleaned.strip("_")
-    return cleaned or "unknown"
+    return cleaned.strip("_") or "unknown"
 
 
-def add_control_type_to_path(path: str | Path, control_type: str) -> Path:
-    path_obj = Path(path)
-    tag = control_type_to_filename_tag(control_type)
-    stem = path_obj.stem if path_obj.suffix else path_obj.name
+def add_control_type_to_path(
+    path: str | Path,
+    control_type: str,
+    *,
+    as_subdir: bool = False,
+) -> Path:
+    """Append a sanitised control-type tag to *path* (filename suffix or subdirectory)."""
+    p = Path(path)
+    tag = _sanitise_tag(control_type)
+
+    if as_subdir:
+        return p if p.parent.name == tag else p.parent / tag / p.name
+
+    stem = p.stem if p.suffix else p.name
     if stem == tag or stem.endswith(f"_{tag}"):
-        return path_obj
-
-    filename = f"{stem}_{tag}{path_obj.suffix}" if path_obj.suffix else f"{stem}_{tag}"
-    return path_obj.with_name(filename)
-
-
-def _validate_range(name: str, bounds: tuple[float, float]) -> None:
-    if bounds[0] > bounds[1]:
-        raise ValueError(f"{name} must satisfy low <= high, got {bounds}.")
+        return p
+    name = f"{stem}_{tag}{p.suffix}" if p.suffix else f"{stem}_{tag}"
+    return p.with_name(name)
 
 
-def _make_generator(
-    *,
-    seed: int | None,
-    generator: torch.Generator | None,
-    device: str,
-) -> torch.Generator:
-    if generator is not None and seed is not None:
-        raise ValueError("Provide either seed or generator, not both.")
-    if generator is not None:
-        return generator
-    local_generator = torch.Generator(device=device)
-    if seed is not None:
-        local_generator.manual_seed(seed)
-    return local_generator
-
-
-def _as_control_tensor(
-    control_value: Tensor | float,
-    *,
-    batch_size: int,
-    reference: Tensor,
-) -> Tensor:
-    if isinstance(control_value, Tensor):
-        u = control_value.to(dtype=reference.dtype, device=reference.device)
-    else:
-        u = torch.tensor(control_value, dtype=reference.dtype, device=reference.device)
-
-    if u.ndim == 0:
-        return u.expand(batch_size, 1)
-
-    if u.ndim == 1:
-        if u.shape[0] == 1:
-            return u.expand(batch_size).unsqueeze(-1)
-        if u.shape[0] == batch_size:
-            return u.unsqueeze(-1)
-
-    if u.ndim == 2 and u.shape[1] == 1:
-        if u.shape[0] == 1:
-            return u.expand(batch_size, 1)
-        if u.shape[0] == batch_size:
-            return u
-
-    raise ValueError(
-        "Control output must be scalar, shape (1,), (batch,), (1, 1), or (batch, 1); "
-        f"got {tuple(u.shape)} for batch={batch_size}."
-    )
-
-
-def make_random_sinusoidal_control_fn(
-    *,
-    num_trajectories: int,
-    config: RandomSinusoidalControlConfig | None = None,
-    seed: int | None = None,
-    generator: torch.Generator | None = None,
-    device: str = "cpu",
-) -> tuple[ControlFn, dict[str, object]]:
-    """Build u_control(t) = A * sin(2*pi*f*t + phase) + b with random f and phase."""
-    cfg = config or RandomSinusoidalControlConfig()
-    if num_trajectories <= 0:
-        raise ValueError(f"num_trajectories must be positive, got {num_trajectories}.")
-
-    _validate_range("frequency_range", cfg.frequency_range)
-    _validate_range("phase_range", cfg.phase_range)
-    local_generator = _make_generator(seed=seed, generator=generator, device=device)
-
-    sample_device = torch.device(device)
-    frequencies = torch.empty((num_trajectories,), device=sample_device)
-    phases = torch.empty((num_trajectories,), device=sample_device)
-    frequencies.uniform_(cfg.frequency_range[0], cfg.frequency_range[1], generator=local_generator)
-    phases.uniform_(cfg.phase_range[0], cfg.phase_range[1], generator=local_generator)
-
-    def control_fn(t: Tensor) -> Tensor:
-        time = t.to(dtype=frequencies.dtype, device=frequencies.device)
-        if time.ndim == 0:
-            time = time.expand(num_trajectories)
-        elif time.ndim == 1 and time.shape[0] == 1:
-            time = time.expand(num_trajectories)
-        elif time.ndim != 1 or time.shape[0] != num_trajectories:
-            raise ValueError(
-                f"Expected t to be scalar or shape ({num_trajectories},), got {tuple(time.shape)}."
-            )
-        u = cfg.amplitude * torch.sin(2.0 * math.pi * frequencies * time + phases) + cfg.bias
-        return u.unsqueeze(-1)
-
-    control_meta: dict[str, object] = {
-        "type": "sinusoidal",
-        "amplitude": cfg.amplitude,
-        "frequency_range": cfg.frequency_range,
-        "phase_range": cfg.phase_range,
-        "bias": cfg.bias,
-        "seed": seed,
-    }
-    return control_fn, control_meta
-
-
-def make_constant_control_fn(
-    *,
-    num_trajectories: int,
-    value: float | list[float] | tuple[float, ...] | Tensor = 0.0,
-    seed: int | None = None,
-    generator: torch.Generator | None = None,
-    device: str = "cpu",
-) -> tuple[ControlFn, dict[str, object]]:
-    if num_trajectories <= 0:
-        raise ValueError(f"num_trajectories must be positive, got {num_trajectories}.")
-    local_generator = _make_generator(seed=seed, generator=generator, device=device)
-
-    if isinstance(value, Tensor):
-        candidates = value.flatten().to(device=device, dtype=torch.float32)
-    elif isinstance(value, (list, tuple)):
-        candidates = torch.tensor(value, device=device, dtype=torch.float32).flatten()
-    else:
-        candidates = torch.tensor([float(value)], device=device, dtype=torch.float32)
-
-    if candidates.numel() == 0:
-        raise ValueError("value must include at least one constant.")
-
-    if candidates.numel() == 1:
-        constants = candidates.expand(num_trajectories).unsqueeze(-1)
-    else:
-        indices = torch.randint(
-            low=0,
-            high=candidates.numel(),
-            size=(num_trajectories,),
-            generator=local_generator,
-            device=torch.device(device),
-        )
-        constants = candidates[indices].unsqueeze(-1)
-
-    def control_fn(t: Tensor) -> Tensor:
-        time = t if isinstance(t, Tensor) else torch.tensor(t, device=constants.device)
-        return constants.to(dtype=time.dtype, device=time.device)
-
-    values_list = [float(v) for v in candidates.detach().cpu().tolist()]
-    control_meta: dict[str, object] = {"type": "constant", "values": values_list}
-    if len(values_list) == 1:
-        control_meta["value"] = values_list[0]
-    else:
-        control_meta["assignment"] = "uniform_random_per_trajectory"
-        control_meta["seed"] = seed
-    return control_fn, control_meta
-
-
-def controlled_vortex_drift(
-    x: Tensor,
-    u: Tensor,
-    config: VortexSystemConfig,
-) -> Tensor:
-    """Compute x' = f(x, u) for the controlled vortex system."""
-    poles = torch.tensor(config.poles, dtype=x.dtype, device=x.device)
-    strengths = torch.tensor(config.strengths, dtype=x.dtype, device=x.device)
-
-    dx = x[:, 0:1] - poles
-    y = x[:, 1:2]
-    r2 = dx.square() + y.square() + config.eps
-
-    base_x = config.background_speed + torch.sum(strengths * (2.0 * y) / r2, dim=-1, keepdim=True)
-    base_y = torch.sum(-strengths * (2.0 * dx) / r2, dim=-1, keepdim=True)
-
-    drift_x = base_x + config.control_gain_x * u
-    drift_y = base_y + config.control_gain_y * u
-    return torch.cat((drift_x, drift_y), dim=-1)
+# ---------------------------------------------------------------------------
+# SDE integration
+# ---------------------------------------------------------------------------
 
 
 def rollout_controlled_system(
     initial_states: Tensor,
     times: Tensor,
-    control_fn: ControlFn,
+    control_fn: ControlFn | SimpleControlFn,
     config: VortexSystemConfig,
-    stochastic: bool = False,
-    generator: torch.Generator | None = None,
 ) -> tuple[Tensor, Tensor]:
-    """Euler rollout for many trajectories in parallel."""
-    states = [initial_states]
-    controls: list[Tensor] = []
+    """Integrate the controlled vortex system via ``torchsde.sdeint``.
 
-    x_t = initial_states
-    dt = times[1] - times[0]
-    sqrt_dt = torch.sqrt(dt)
+    Controls are pre-computed (open-loop) at each interval boundary, then
+    applied as a stepwise-constant schedule during SDE integration.
+    """
+    batch_size = initial_states.shape[0]
 
+    # Pre-compute open-loop controls at each interval start
+    control_list = []
     for step in range(times.numel() - 1):
-        t = times[step]
-        u_t = _as_control_tensor(control_fn(t), batch_size=x_t.shape[0], reference=x_t)
-        drift = controlled_vortex_drift(x_t, u_t, config)
+        u_t = _as_control_tensor(
+            control_fn(times[step], initial_states),
+            batch_size=batch_size,
+            reference=initial_states,
+        )
+        control_list.append(u_t)
+    controls = torch.stack(control_list, dim=1)  # (batch, K, control_dim)
 
-        if stochastic and config.diffusion != 0.0:
-            noise = torch.randn(
-                x_t.shape,
-                dtype=x_t.dtype,
-                device=x_t.device,
-                generator=generator,
-            )
-            noise = config.diffusion * sqrt_dt * noise
-        else:
-            noise = torch.zeros_like(x_t)
+    sde = VortexSDE(config)
+    dt = float(times[1] - times[0])
+    with sde.controlled(times, controls):
+        traj = torchsde.sdeint(sde, initial_states, times, method="euler", dt=dt)
 
-        x_t = x_t + dt * drift + noise
-        states.append(x_t)
-        controls.append(u_t)
+    # sdeint returns (T, batch, state_dim) -> (batch, T, state_dim)
+    states = traj.permute(1, 0, 2)
+    return states, controls
 
-    return torch.stack(states, dim=1), torch.stack(controls, dim=1)
+
+# ---------------------------------------------------------------------------
+# Dataset generation
+# ---------------------------------------------------------------------------
 
 
 def generate_dataset(
@@ -282,18 +112,22 @@ def generate_dataset(
     state_box: tuple[float, float, float, float] = (-4.0, 4.0, -2.0, 2.0),
     seed: int = 7,
     config: VortexSystemConfig | None = None,
-    control_fn: ControlFn = default_control_fn,
+    control_fn: ControlFn | SimpleControlFn | None = None,
     device: str = "cpu",
 ) -> dict[str, object]:
-    """Generate trajectory dataset for controlled dynamics."""
+    """Generate a trajectory dataset for controlled dynamics."""
     cfg = config or VortexSystemConfig()
-    generator = torch.Generator(device=device)
-    generator.manual_seed(seed)
+    gen = torch.Generator(device=device)
+    gen.manual_seed(seed)
+
+    if control_fn is None:
+        # Sensible default: zero control
+        control_fn = lambda t, x: torch.zeros(x.shape[0], 1, device=x.device, dtype=x.dtype)
 
     xmin, xmax, ymin, ymax = state_box
     x0 = torch.empty((num_trajectories, 2), device=device)
-    x0[:, 0].uniform_(xmin, xmax, generator=generator)
-    x0[:, 1].uniform_(ymin, ymax, generator=generator)
+    x0[:, 0].uniform_(xmin, xmax, generator=gen)
+    x0[:, 1].uniform_(ymin, ymax, generator=gen)
 
     steps = int(round(horizon / dt)) + 1
     times = torch.linspace(0.0, horizon, steps=steps, device=device)
@@ -303,8 +137,6 @@ def generate_dataset(
         times=times,
         control_fn=control_fn,
         config=cfg,
-        stochastic=False,
-        generator=generator,
     )
 
     return {
@@ -315,41 +147,55 @@ def generate_dataset(
     }
 
 
+# ---------------------------------------------------------------------------
+# Persistence
+# ---------------------------------------------------------------------------
+
+
 def save_dataset(payload: dict[str, object], path: str | Path) -> None:
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(payload, path)
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(payload, p)
 
 
 def load_dataset(path: str | Path) -> dict[str, object]:
-    return torch.load(Path(path), map_location="cpu")
+    return torch.load(Path(path), map_location="cpu", weights_only=False)
+
+
+# ---------------------------------------------------------------------------
+# PyTorch Dataset
+# ---------------------------------------------------------------------------
 
 
 class ControlledTrajectoryDataset(Dataset[dict[str, Tensor]]):
-    def __init__(self, payload: dict[str, object]) -> None:
-        self.times = payload["times"]
-        self.states = payload["states"]
-        self.controls = payload["controls"]
+    """Map-style dataset wrapping a trajectory payload."""
 
-        if not isinstance(self.times, Tensor) or not isinstance(self.states, Tensor) or not isinstance(self.controls, Tensor):
+    def __init__(self, payload: dict[str, object]) -> None:
+        self.times: Tensor = payload["times"]  # type: ignore[assignment]
+        self.states: Tensor = payload["states"]  # type: ignore[assignment]
+        self.controls: Tensor = payload["controls"]  # type: ignore[assignment]
+
+        if not all(isinstance(t, Tensor) for t in (self.times, self.states, self.controls)):
             raise TypeError("Dataset payload has invalid tensor fields.")
 
     @classmethod
-    def from_file(cls, path: str | Path) -> "ControlledTrajectoryDataset":
-        payload = load_dataset(path)
-        return cls(payload)
+    def from_file(cls, path: str | Path) -> ControlledTrajectoryDataset:
+        return cls(load_dataset(path))
 
     def __len__(self) -> int:
         return self.states.shape[0]
 
     def __getitem__(self, index: int) -> dict[str, Tensor]:
-        return {
-            "states": self.states[index],
-            "controls": self.controls[index],
-        }
+        return {"states": self.states[index], "controls": self.controls[index]}
+
+
+# ---------------------------------------------------------------------------
+# Config reconstruction
+# ---------------------------------------------------------------------------
 
 
 def config_from_payload(payload: dict[str, object]) -> VortexSystemConfig:
+    """Reconstruct a :class:`VortexSystemConfig` from a saved payload."""
     raw = payload.get("config")
     if not isinstance(raw, dict):
         return VortexSystemConfig()

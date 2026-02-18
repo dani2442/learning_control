@@ -1,16 +1,21 @@
+"""Learned neural SDE model: architecture, training, evaluation, and checkpointing."""
+
 from __future__ import annotations
 
+import logging
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Callable, Mapping
 
 import torch
 import torch.nn as nn
+import torchsde
 from torch import Tensor
 from torch.utils.data import DataLoader
 
+from src.controls import ControlFn
+from src.sde import ControlledSDE
 
-ControlFn = Callable[[Tensor, Tensor], Tensor]
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -23,37 +28,25 @@ class TrainingConfig:
     method: str = "euler"
 
 
-class ControlledNeuralSDE(nn.Module):
-    noise_type = "diagonal"
-    sde_type = "ito"
+class ControlledNeuralSDE(ControlledSDE):
+    """Learned SDE whose drift is parameterised by a neural network."""
 
     def __init__(
         self,
         state_dim: int = 2,
         control_dim: int = 1,
         hidden_dim: int = 64,
-        min_diffusion: float = 0.0,
     ) -> None:
-        super().__init__()
+        super().__init__(control_dim=control_dim)
         self.state_dim = state_dim
-        self.control_dim = control_dim
-        self.min_diffusion = min_diffusion
 
-        in_dim = state_dim + 1
+        in_dim = state_dim + 1  # state + time
         self.drift_net = nn.Sequential(
             nn.Linear(in_dim, hidden_dim),
             nn.Tanh(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.Tanh(),
             nn.Linear(hidden_dim, state_dim),
-        )
-        self.diffusion_net = nn.Sequential(
-            nn.Linear(in_dim, hidden_dim),
-            nn.Tanh(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.Tanh(),
-            nn.Linear(hidden_dim, state_dim),
-            nn.Softplus(),
         )
 
         control_matrix = torch.zeros((state_dim, control_dim), dtype=torch.float32)
@@ -62,91 +55,42 @@ class ControlledNeuralSDE(nn.Module):
         self.register_buffer("control_matrix", control_matrix)
 
         self._control_fn: ControlFn = lambda t, x: torch.zeros(
-            (x.shape[0], control_dim),
-            device=x.device,
-            dtype=x.dtype,
+            (x.shape[0], control_dim), device=x.device, dtype=x.dtype,
         )
-        self._control_times: Tensor | None = None
-        self._control_values: Tensor | None = None
 
     def set_control_fn(self, control_fn: ControlFn) -> None:
         self._control_fn = control_fn
 
-    def set_control_trajectory(self, times: Tensor, controls: Tensor) -> None:
-        self._control_times = times
-        self._control_values = controls
-
-    def clear_control_trajectory(self) -> None:
-        self._control_times = None
-        self._control_values = None
+    def _lookup_control(self, t: Tensor, y: Tensor) -> Tensor:
+        """Zero-order hold with fallback to the callable control function."""
+        if self._control_times is None or self._control_values is None:
+            return self._control_fn(t, y)
+        return super()._lookup_control(t, y)
 
     def _prepare_features(self, t: Tensor, y: Tensor) -> Tensor:
         if t.ndim == 0:
             t = t.expand(y.shape[0])
-        t = t.to(device=y.device, dtype=y.dtype).unsqueeze(-1)
-        return torch.cat((y, t), dim=-1)
-
-    def _control_from_trajectory(self, t: Tensor, y: Tensor) -> Tensor:
-        if self._control_times is None or self._control_values is None:
-            return self._control_fn(t, y)
-
-        times = self._control_times.to(device=y.device, dtype=y.dtype)
-        controls = self._control_values.to(device=y.device, dtype=y.dtype)
-
-        t_scalar = t.to(device=y.device, dtype=y.dtype)
-        if t_scalar.ndim > 0:
-            t_scalar = t_scalar.reshape(1)[0]
-        t_clamped = torch.clamp(t_scalar, min=times[0], max=times[-1])
-
-        right = int(torch.searchsorted(times, t_clamped, right=False).item())
-        if right <= 0:
-            return controls[:, 0, :]
-        if right >= times.shape[0]:
-            return controls[:, -1, :]
-
-        left = right - 1
-        t0 = times[left]
-        t1 = times[right]
-        alpha = (t_clamped - t0) / (t1 - t0 + 1e-12)
-        return (1.0 - alpha) * controls[:, left, :] + alpha * controls[:, right, :]
+        return torch.cat((y, t.to(device=y.device, dtype=y.dtype).unsqueeze(-1)), dim=-1)
 
     def drift_with_control(self, t: Tensor, y: Tensor, u: Tensor) -> Tensor:
-        features = self._prepare_features(t=t, y=y)
-        base_drift = self.drift_net(features)
-
+        """Compute the drift: neural_net(y, t) + B @ u."""
+        base_drift = self.drift_net(self._prepare_features(t, y))
         if u.ndim == 1:
             u = u.unsqueeze(-1)
         control_term = u @ self.control_matrix.T.to(dtype=y.dtype, device=y.device)
         return base_drift + control_term
 
-    def diffusion_with_control(self, t: Tensor, y: Tensor) -> Tensor:
-        # Deterministic setting: learned diffusion is disabled.
-        return torch.zeros_like(y)
-
     def f(self, t: Tensor, y: Tensor) -> Tensor:
-        u = self._control_from_trajectory(t, y)
+        u = self._lookup_control(t, y)
         return self.drift_with_control(t=t, y=y, u=u)
 
     def g(self, t: Tensor, y: Tensor) -> Tensor:
-        return self.diffusion_with_control(t=t, y=y)
+        return torch.zeros_like(y)
 
 
-def _rollout_deterministic(
-    model: ControlledNeuralSDE,
-    x0: Tensor,
-    times: Tensor,
-    controls: Tensor,
-) -> Tensor:
-    x_t = x0
-    traj = [x_t]
-    for step in range(times.shape[0] - 1):
-        t = times[step]
-        dt = times[step + 1] - times[step]
-        u_t = controls[:, step, :]
-        drift = model.drift_with_control(t=t, y=x_t, u=u_t)
-        x_t = x_t + dt * drift
-        traj.append(x_t)
-    return torch.stack(traj, dim=1)
+# ---------------------------------------------------------------------------
+# Training & evaluation
+# ---------------------------------------------------------------------------
 
 
 def train_neural_sde(
@@ -157,19 +101,16 @@ def train_neural_sde(
     val_dataloader: DataLoader[dict[str, Tensor]] | None = None,
     device: str = "cpu",
 ) -> dict[str, list[float]]:
+    """Train the neural SDE on trajectory data."""
     model.to(device)
     times = times.to(device)
 
     optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=config.lr,
-        weight_decay=config.weight_decay,
+        model.parameters(), lr=config.lr, weight_decay=config.weight_decay,
     )
 
-    history: dict[str, list[float]] = {
-        "train_loss": [],
-        "val_loss": [],
-    }
+    history: dict[str, list[float]] = {"train_loss": [], "val_loss": []}
+
     for epoch in range(config.epochs):
         model.train()
         running = 0.0
@@ -179,21 +120,9 @@ def train_neural_sde(
             controls = batch["controls"].to(device)
             x0 = states[:, 0, :]
 
-            if controls.shape[1] != times.shape[0]:
-                if controls.shape[1] == times.shape[0] - 1:
-                    controls = torch.cat((controls, controls[:, -1:, :]), dim=1)
-                else:
-                    raise ValueError(
-                        f"Invalid controls shape {controls.shape}; expected T or T-1 with T={times.shape[0]}"
-                    )
-
-            preds = _rollout_deterministic(
-                model=model,
-                x0=x0,
-                times=times,
-                controls=controls,
-            )
-
+            with model.controlled(times, controls):
+                traj = torchsde.sdeint(model, x0, times, method=config.method, dt=config.solver_dt)
+            preds = traj.permute(1, 0, 2)
             loss = torch.mean((preds - states) ** 2)
 
             optimizer.zero_grad(set_to_none=True)
@@ -207,23 +136,14 @@ def train_neural_sde(
         history["train_loss"].append(epoch_loss)
 
         if val_dataloader is not None:
-            val_loss = evaluate_neural_sde(
-                model=model,
-                dataloader=val_dataloader,
-                times=times,
-                config=config,
-                device=device,
-            )
+            val_loss = evaluate_neural_sde(model, val_dataloader, times, config, device)
             history["val_loss"].append(val_loss)
 
         if epoch == 0 or (epoch + 1) % 25 == 0 or epoch == config.epochs - 1:
-            if val_dataloader is None:
-                print(f"epoch={epoch + 1:04d} train_loss={epoch_loss:.6f}")
-            else:
-                print(
-                    f"epoch={epoch + 1:04d} train_loss={epoch_loss:.6f} "
-                    f"val_loss={history['val_loss'][-1]:.6f}"
-                )
+            msg = f"epoch={epoch + 1:04d} train_loss={epoch_loss:.6f}"
+            if val_dataloader is not None:
+                msg += f" val_loss={history['val_loss'][-1]:.6f}"
+            logger.info(msg)
 
     return history
 
@@ -236,6 +156,7 @@ def evaluate_neural_sde(
     config: TrainingConfig,
     device: str = "cpu",
 ) -> float:
+    """Evaluate mean squared prediction error on a dataloader."""
     model.eval()
     times = times.to(device)
 
@@ -245,117 +166,57 @@ def evaluate_neural_sde(
         controls = batch["controls"].to(device)
         x0 = states[:, 0, :]
 
-        if controls.shape[1] != times.shape[0]:
-            if controls.shape[1] == times.shape[0] - 1:
-                controls = torch.cat((controls, controls[:, -1:, :]), dim=1)
-            else:
-                raise ValueError(
-                    f"Invalid controls shape {controls.shape}; expected T or T-1 with T={times.shape[0]}"
-                )
-
-        preds = _rollout_deterministic(
-            model=model,
-            x0=x0,
-            times=times,
-            controls=controls,
-        )
-
-        loss = torch.mean((preds - states) ** 2)
-        running += float(loss.item())
+        with model.controlled(times, controls):
+            traj = torchsde.sdeint(model, x0, times, method=config.method, dt=config.solver_dt)
+        preds = traj.permute(1, 0, 2)
+        running += float(torch.mean((preds - states) ** 2).item())
 
     return running / max(len(dataloader), 1)
+
+
+# ---------------------------------------------------------------------------
+# Checkpointing
+# ---------------------------------------------------------------------------
 
 
 def save_checkpoint(
     model: ControlledNeuralSDE,
     path: str | Path,
     training_config: TrainingConfig,
-    history: dict[str, list[float]] | list[float],
+    history: dict[str, list[float]],
 ) -> None:
-    if isinstance(history, list):
-        history_payload: dict[str, list[float]] = {
-            "train_loss": history,
-            "val_loss": [],
-        }
-    else:
-        history_payload = history
-
+    """Save model weights, architecture config, and loss history."""
     payload = {
         "state_dict": model.state_dict(),
         "model_config": {
             "state_dim": model.state_dim,
             "control_dim": model.control_dim,
             "hidden_dim": int(model.drift_net[0].out_features),
-            "min_diffusion": float(model.min_diffusion),
         },
         "training_config": asdict(training_config),
-        "loss_history": history_payload,
+        "loss_history": history,
     }
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(payload, path)
-
-
-def _infer_model_config(
-    model_cfg: object,
-    state_dict: Mapping[str, Tensor],
-) -> dict[str, int | float]:
-    cfg = model_cfg if isinstance(model_cfg, dict) else {}
-
-    control_matrix = state_dict.get("control_matrix")
-    state_from_matrix: int | None = None
-    control_from_matrix: int | None = None
-    if isinstance(control_matrix, torch.Tensor) and control_matrix.ndim == 2:
-        state_from_matrix = int(control_matrix.shape[0])
-        control_from_matrix = int(control_matrix.shape[1])
-
-    drift_in_weight = state_dict.get("drift_net.0.weight")
-    hidden_from_weight: int | None = None
-    if isinstance(drift_in_weight, torch.Tensor) and drift_in_weight.ndim == 2:
-        hidden_from_weight = int(drift_in_weight.shape[0])
-
-    drift_out_weight = state_dict.get("drift_net.4.weight")
-    state_from_output: int | None = None
-    if isinstance(drift_out_weight, torch.Tensor) and drift_out_weight.ndim == 2:
-        state_from_output = int(drift_out_weight.shape[0])
-
-    state_dim = state_from_matrix or state_from_output or int(cfg.get("state_dim", 2))
-    control_dim = control_from_matrix or int(cfg.get("control_dim", 1))
-    hidden_dim = hidden_from_weight or int(cfg.get("hidden_dim", 64))
-    min_diffusion = float(cfg.get("min_diffusion", 0.0))
-
-    return {
-        "state_dim": state_dim,
-        "control_dim": control_dim,
-        "hidden_dim": hidden_dim,
-        "min_diffusion": min_diffusion,
-    }
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(payload, p)
 
 
 def load_checkpoint(
     path: str | Path,
     device: str = "cpu",
 ) -> tuple[ControlledNeuralSDE, dict[str, object]]:
-    loaded = torch.load(Path(path), map_location=device)
-    if isinstance(loaded, dict) and "state_dict" in loaded:
-        payload: dict[str, object] = loaded
-        state_dict = payload["state_dict"]
-    elif isinstance(loaded, dict):
-        payload = {"state_dict": loaded}
-        state_dict = loaded
-    else:
-        raise TypeError(f"Unsupported checkpoint format in {path}: {type(loaded)}")
+    """Load a model from a checkpoint file."""
+    payload = torch.load(Path(path), map_location=device, weights_only=False)
+    if not isinstance(payload, dict) or "state_dict" not in payload:
+        raise TypeError(f"Unsupported checkpoint format in {path}")
 
-    if not isinstance(state_dict, dict):
-        raise TypeError(f"Checkpoint state_dict in {path} must be a dict, got {type(state_dict)}")
-
-    model_cfg = _infer_model_config(payload.get("model_config", {}), state_dict)
+    cfg = payload["model_config"]
     model = ControlledNeuralSDE(
-        state_dim=int(model_cfg["state_dim"]),
-        control_dim=int(model_cfg["control_dim"]),
-        hidden_dim=int(model_cfg["hidden_dim"]),
-        min_diffusion=float(model_cfg["min_diffusion"]),
+        state_dim=int(cfg["state_dim"]),
+        control_dim=int(cfg["control_dim"]),
+        hidden_dim=int(cfg["hidden_dim"]),
     )
-    model.load_state_dict(state_dict)
+    # strict=False: ignore legacy keys (e.g. diffusion_net) from older checkpoints
+    model.load_state_dict(payload["state_dict"], strict=False)
     model.to(device)
     return model, payload

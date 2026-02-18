@@ -64,7 +64,7 @@ pip install -e .
 ### 1) Generate data
 Random sinusoidal control (`u_control(t)` with random frequency and phase):
 ```bash
-.venv/bin/python examples/generate_data.py \
+python examples/generate_data.py \
   --output data/controlled_vortex.pt \
   --num-trajectories 512 \
   --horizon 4.0 \
@@ -77,7 +77,7 @@ Random sinusoidal control (`u_control(t)` with random frequency and phase):
 
 Constant control (`u_control(t) = c`, modifiable with `--constant-value`):
 ```bash
-.venv/bin/python examples/generate_data.py \
+python examples/generate_data.py \
   --output data/controlled_vortex_constant.pt \
   --num-trajectories 512 \
   --horizon 4.0 \
@@ -89,7 +89,7 @@ When multiple values are provided, each trajectory is assigned one value uniform
 
 ### 2) Train neural dynamics model
 ```bash
-.venv/bin/python examples/train_model.py \
+python examples/train_model.py \
   --dataset data/controlled_vortex.pt \
   --checkpoint data/neural_sde.pt \
   --epochs 250 \
@@ -100,7 +100,7 @@ When multiple values are provided, each trajectory is assigned one value uniform
 
 ### 3) Compare optimal control transfer
 ```bash
-.venv/bin/python examples/optimal_control.py \
+python examples/optimal_control.py \
   --dataset data/controlled_vortex.pt \
   --checkpoint data/neural_sde.pt \
   --x0 -3.0 1.2 \
@@ -159,3 +159,9 @@ print("final_train_loss:", history["train_loss"][-1])
 - `data/` artifacts are git-ignored.
 - `--plot` is available on generation/control scripts for immediate visualization.
 - `train_model.py` supports train/validation split via `--val-ratio`.
+
+
+```bash
+.venv/bin/python examples/run_pipeline.py --control-type constant --image-dir images
+.venv/bin/python examples/run_pipeline.py --control-type sinusoidal --image-dir images
+```

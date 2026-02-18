@@ -1,16 +1,18 @@
+"""Train a controlled Neural SDE on trajectory data."""
+
 from __future__ import annotations
 
 import argparse
+import logging
 import sys
 from pathlib import Path
 
 import torch
-from torch.utils.data import DataLoader
-from torch.utils.data import random_split
+from torch.utils.data import DataLoader, random_split
 
-ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.dataset import (
     ControlledTrajectoryDataset,
@@ -21,6 +23,8 @@ from src.dataset import (
 )
 from src.model import ControlledNeuralSDE, TrainingConfig, save_checkpoint, train_neural_sde
 from src.visualization import plot_vector_field_error_map
+
+logging.basicConfig(level=logging.INFO, format="%(message)s")
 
 
 def parse_args() -> argparse.Namespace:
@@ -37,6 +41,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--plot-error-map", dest="plot_error_map", action="store_true")
     parser.add_argument("--no-plot-error-map", dest="plot_error_map", action="store_false")
     parser.set_defaults(plot_error_map=True)
+    parser.add_argument("--show-plot", dest="show_plot", action="store_true")
+    parser.add_argument("--no-show-plot", dest="show_plot", action="store_false")
+    parser.set_defaults(show_plot=False)
     parser.add_argument("--error-map-grid", type=int, default=150)
     parser.add_argument("--image-dir", type=str, default="images")
     return parser.parse_args()
@@ -53,11 +60,8 @@ def main() -> None:
     if not 0.0 <= args.val_ratio < 1.0:
         raise ValueError(f"--val-ratio must satisfy 0 <= val_ratio < 1, got {args.val_ratio}.")
 
-    val_size = int(len(dataset) * args.val_ratio)
-    if args.val_ratio > 0.0 and val_size == 0 and len(dataset) > 1:
-        val_size = 1
-    if val_size >= len(dataset):
-        val_size = len(dataset) - 1
+    val_size = max(1, round(len(dataset) * args.val_ratio)) if args.val_ratio > 0. else 0
+    val_size = min(val_size, len(dataset) - 1)
     train_size = len(dataset) - val_size
 
     train_dataset, val_dataset = random_split(
@@ -108,17 +112,12 @@ def main() -> None:
         print(f"final_val_loss={history['val_loss'][-1]:.6f}")
 
     if args.plot_error_map:
-        states = payload["states"]
-        if not isinstance(states, torch.Tensor):
-            raise TypeError("Payload does not contain valid states tensor.")
-
-        x_values = states[:, :, 0]
-        y_values = states[:, :, 1]
-        # xlim = (float(torch.min(x_values).item()) - 0.5, float(torch.max(x_values).item()) + 0.5)
-        # ylim = (float(torch.min(y_values).item()) - 0.5, float(torch.max(y_values).item()) + 0.5)
-
         model.eval()
-        error_map_path = add_control_type_to_path(Path(args.image_dir) / "train_model_error_map.pdf", control_type)
+        error_map_path = add_control_type_to_path(
+            Path(args.image_dir) / "train_model_error_map.pdf",
+            control_type,
+            as_subdir=True,
+        )
         plot_vector_field_error_map(
             model=model,
             config=config_from_payload(payload),
@@ -130,6 +129,7 @@ def main() -> None:
             error_vmax=5.0,
             device=args.device,
             save_path=error_map_path,
+            show=args.show_plot,
         )
 
 
