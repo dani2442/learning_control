@@ -92,7 +92,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-lines", type=int, default=60)
     p.add_argument("--stream-grid", type=int, default=220)
     p.add_argument("--error-grid", type=int, default=150)
-    p.add_argument("--error-vmax", type=float, default=5)
+    p.add_argument("--error-vmax", type=float, default=2)
     p.add_argument("--image-dir", type=str, default="images")
     p.add_argument("--show-plot", dest="show_plot", action=argparse.BooleanOptionalAction, default=False)
 
