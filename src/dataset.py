@@ -4,18 +4,13 @@ from __future__ import annotations
 
 from dataclasses import asdict
 from pathlib import Path
-from typing import Callable
-
 import torch
 import torchsde
 from torch import Tensor
 from torch.utils.data import Dataset
 
 from src.controls import ControlFn, _as_control_tensor
-from src.dynamics import VortexSDE, VortexSystemConfig
-
-# Legacy-compatible type alias (control factories now live in src.controls)
-SimpleControlFn = Callable[[Tensor], Tensor | float]
+from src.dynamics import VORTEX_CONTROL_DIM, VortexSDE, VortexSystemConfig
 
 
 # ---------------------------------------------------------------------------
@@ -25,13 +20,8 @@ SimpleControlFn = Callable[[Tensor], Tensor | float]
 
 def control_type_from_payload(payload: dict[str, object], *, default: str = "unknown") -> str:
     """Extract the control-type string stored inside a dataset payload."""
-    control = payload.get("control")
-    if not isinstance(control, dict):
-        return default
-    control_type = control.get("type")
-    if isinstance(control_type, str) and control_type.strip():
-        return control_type.strip()
-    return default
+    control = payload.get("control", {})  # type: ignore[assignment]
+    return str(control.get("type", default)).strip()
 
 
 def _sanitise_tag(control_type: str) -> str:
@@ -52,12 +42,10 @@ def add_control_type_to_path(
     tag = _sanitise_tag(control_type)
 
     if as_subdir:
-        return p if p.parent.name == tag else p.parent / tag / p.name
+        return p.parent / tag / p.name
 
-    stem = p.stem if p.suffix else p.name
-    if stem == tag or stem.endswith(f"_{tag}"):
-        return p
-    name = f"{stem}_{tag}{p.suffix}" if p.suffix else f"{stem}_{tag}"
+    stem = p.stem
+    name = f"{stem}_{tag}{p.suffix}"
     return p.with_name(name)
 
 
@@ -69,7 +57,7 @@ def add_control_type_to_path(
 def rollout_controlled_system(
     initial_states: Tensor,
     times: Tensor,
-    control_fn: ControlFn | SimpleControlFn,
+    control_fn: ControlFn,
     config: VortexSystemConfig,
 ) -> tuple[Tensor, Tensor]:
     """Integrate the controlled vortex system via ``torchsde.sdeint``.
@@ -82,8 +70,9 @@ def rollout_controlled_system(
     # Pre-compute open-loop controls at each interval start
     control_list = []
     for step in range(times.numel() - 1):
+        u_raw = control_fn(times[step], initial_states)
         u_t = _as_control_tensor(
-            control_fn(times[step], initial_states),
+            u_raw,
             batch_size=batch_size,
             reference=initial_states,
         )
@@ -110,9 +99,10 @@ def generate_dataset(
     horizon: float = 4.0,
     dt: float = 0.02,
     state_box: tuple[float, float, float, float] = (-4.0, 4.0, -2.0, 2.0),
+    pole_exclusion_radius: float = 0.0,
     seed: int = 7,
     config: VortexSystemConfig | None = None,
-    control_fn: ControlFn | SimpleControlFn | None = None,
+    control_fn: ControlFn | None = None,
     device: str = "cpu",
 ) -> dict[str, object]:
     """Generate a trajectory dataset for controlled dynamics."""
@@ -120,14 +110,37 @@ def generate_dataset(
     gen = torch.Generator(device=device)
     gen.manual_seed(seed)
 
-    if control_fn is None:
-        # Sensible default: zero control
-        control_fn = lambda t, x: torch.zeros(x.shape[0], 1, device=x.device, dtype=x.dtype)
+    control_fn = control_fn or (
+        lambda t, x: torch.zeros(
+            x.shape[0],
+            VORTEX_CONTROL_DIM,
+            device=x.device,
+            dtype=x.dtype,
+        )
+    )
 
     xmin, xmax, ymin, ymax = state_box
     x0 = torch.empty((num_trajectories, 2), device=device)
     x0[:, 0].uniform_(xmin, xmax, generator=gen)
     x0[:, 1].uniform_(ymin, ymax, generator=gen)
+
+    if pole_exclusion_radius > 0.0:
+        poles = torch.tensor(cfg.poles, device=device, dtype=x0.dtype)
+        radius_sq = float(pole_exclusion_radius) ** 2
+
+        def _inside_exclusion(points: Tensor) -> Tensor:
+            dx = points[:, 0:1] - poles.unsqueeze(0)
+            dy = points[:, 1:2]
+            return (dx.square() + dy.square() < radius_sq).any(dim=1)
+
+        invalid = _inside_exclusion(x0)
+        while torch.any(invalid):
+            n_bad = int(invalid.sum().item())
+            replacement = torch.empty((n_bad, 2), device=device)
+            replacement[:, 0].uniform_(xmin, xmax, generator=gen)
+            replacement[:, 1].uniform_(ymin, ymax, generator=gen)
+            x0[invalid] = replacement
+            invalid = _inside_exclusion(x0)
 
     steps = int(round(horizon / dt)) + 1
     times = torch.linspace(0.0, horizon, steps=steps, device=device)
@@ -175,9 +188,6 @@ class ControlledTrajectoryDataset(Dataset[dict[str, Tensor]]):
         self.states: Tensor = payload["states"]  # type: ignore[assignment]
         self.controls: Tensor = payload["controls"]  # type: ignore[assignment]
 
-        if not all(isinstance(t, Tensor) for t in (self.times, self.states, self.controls)):
-            raise TypeError("Dataset payload has invalid tensor fields.")
-
     @classmethod
     def from_file(cls, path: str | Path) -> ControlledTrajectoryDataset:
         return cls(load_dataset(path))
@@ -196,9 +206,7 @@ class ControlledTrajectoryDataset(Dataset[dict[str, Tensor]]):
 
 def config_from_payload(payload: dict[str, object]) -> VortexSystemConfig:
     """Reconstruct a :class:`VortexSystemConfig` from a saved payload."""
-    raw = payload.get("config")
-    if not isinstance(raw, dict):
-        return VortexSystemConfig()
+    raw = payload["config"]  # type: ignore[assignment]
     return VortexSystemConfig(
         background_speed=float(raw["background_speed"]),
         poles=tuple(raw["poles"]),

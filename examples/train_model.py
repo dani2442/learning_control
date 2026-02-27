@@ -34,16 +34,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--hidden-dim", type=int, default=128)
+    parser.add_argument(
+        "--mlp-layers",
+        "--num-layers",
+        dest="mlp_layers",
+        type=int,
+        default=2,
+        help="Number of hidden layers in the neural drift MLP.",
+    )
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--val-ratio", type=float, default=0.2)
     parser.add_argument("--split-seed", type=int, default=7)
     parser.add_argument("--device", type=str, default="cpu")
-    parser.add_argument("--plot-error-map", dest="plot_error_map", action="store_true")
-    parser.add_argument("--no-plot-error-map", dest="plot_error_map", action="store_false")
-    parser.set_defaults(plot_error_map=True)
-    parser.add_argument("--show-plot", dest="show_plot", action="store_true")
-    parser.add_argument("--no-show-plot", dest="show_plot", action="store_false")
-    parser.set_defaults(show_plot=False)
+    parser.add_argument(
+        "--plot-error-map",
+        dest="plot_error_map",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument(
+        "--show-plot",
+        dest="show_plot",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
     parser.add_argument("--error-map-grid", type=int, default=150)
     parser.add_argument("--image-dir", type=str, default="images")
     return parser.parse_args()
@@ -87,7 +101,14 @@ def main() -> None:
         else None
     )
 
-    model = ControlledNeuralSDE(hidden_dim=args.hidden_dim)
+    controls = payload.get("controls")
+    if not isinstance(controls, torch.Tensor) or controls.ndim != 3:
+        raise ValueError("payload['controls'] must be a tensor with shape (batch, K, control_dim).")
+    model = ControlledNeuralSDE(
+        control_dim=int(controls.shape[-1]),
+        hidden_dim=args.hidden_dim,
+        num_layers=args.mlp_layers,
+    )
 
     config = TrainingConfig(
         epochs=args.epochs,

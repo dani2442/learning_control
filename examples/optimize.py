@@ -43,7 +43,20 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--checkpoint", type=str, default="data/neural_sde.pt")
     p.add_argument("--x0", type=float, nargs=2, default=(-3.0, 1.2))
     p.add_argument("--target", type=float, nargs=2, default=(2.5, -0.8))
-    p.add_argument("--horizon-steps", type=int, default=OptimalControlConfig.horizon_steps)
+    p.add_argument(
+        "--control-horizon-steps",
+        "--horizon-steps",
+        dest="control_horizon_steps",
+        type=int,
+        default=OptimalControlConfig.horizon_steps,
+        help="Number of piecewise-constant control intervals.",
+    )
+    p.add_argument(
+        "--control-horizon-time",
+        type=float,
+        default=OptimalControlConfig.horizon_time,
+        help="Total control horizon in seconds.",
+    )
     p.add_argument("--iters", type=int, default=OptimalControlConfig.steps)
     p.add_argument("--max-abs-control", type=float, default=OptimalControlConfig.max_abs_control)
     p.add_argument("--control-lr", type=float, default=OptimalControlConfig.lr)
@@ -62,10 +75,11 @@ def parse_args() -> argparse.Namespace:
 # ---------------------------------------------------------------------------
 
 
-def _build_config(args, dt: float) -> OptimalControlConfig:
+def _build_config(args, solver_dt: float) -> OptimalControlConfig:
     return OptimalControlConfig(
-        horizon_steps=args.horizon_steps,
-        dt=dt,
+        horizon_steps=args.control_horizon_steps,
+        horizon_time=args.control_horizon_time,
+        solver_dt=solver_dt,
         max_abs_control=args.max_abs_control,
         steps=args.iters,
         lr=args.control_lr,
@@ -119,8 +133,20 @@ def _run_compare(args, vortex_sde, model, x0, target, cfg, system_config):
     controls_real, traj_rr, _ = optimize_open_loop_controls(vortex_sde, x0, target, cfg)
     controls_learned, traj_ll, _ = optimize_open_loop_controls(model, x0, target, cfg)
 
-    traj_rl = rollout(model, x0, controls_real, cfg.dt)
-    traj_lr = rollout(vortex_sde, x0, controls_learned, cfg.dt)
+    traj_rl = rollout(
+        model,
+        x0,
+        controls_real,
+        cfg.solver_dt,
+        horizon_time=cfg.horizon_time,
+    )
+    traj_lr = rollout(
+        vortex_sde,
+        x0,
+        controls_learned,
+        cfg.solver_dt,
+        horizon_time=cfg.horizon_time,
+    )
 
     print("Comparison (terminal L2 error):")
     print(f"  optimize real,    eval real:    {terminal_error(traj_rr, target):.4f}")
@@ -162,8 +188,8 @@ def main() -> None:
     payload = load_dataset(args.dataset)
     control_type = control_type_from_payload(payload)
     system_config = config_from_payload(payload)
-    dt = float(payload["times"][1] - payload["times"][0])
-    cfg = _build_config(args, dt)
+    solver_dt = float(payload["times"][1] - payload["times"][0])
+    cfg = _build_config(args, solver_dt)
 
     x0 = torch.tensor(args.x0, dtype=torch.float32, device=device)
     target = torch.tensor(args.target, dtype=torch.float32, device=device)

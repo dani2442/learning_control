@@ -100,14 +100,18 @@ python examples/train_model.py \
 
 ### 3) Compare optimal control transfer
 ```bash
-python examples/optimal_control.py \
+python examples/optimize.py \
   --dataset data/controlled_vortex.pt \
   --checkpoint data/neural_sde.pt \
   --x0 -3.0 1.2 \
   --target 2.5 -0.8 \
-  --horizon-steps 80 \
+  --control-horizon-time 2.0 \
+  --control-horizon-steps 80 \
   --iters 500
 ```
+
+`--control-horizon-time` and `--control-horizon-steps` define the control grid,
+while solver integration still uses the dataset time spacing.
 
 Printed metrics are terminal L2 errors for:
 - optimize on real -> evaluate on real

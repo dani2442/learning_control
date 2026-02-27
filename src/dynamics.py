@@ -10,6 +10,8 @@ from torch import Tensor
 
 from src.sde import ControlledSDE
 
+VORTEX_CONTROL_DIM = 2
+
 
 @dataclass(frozen=True)
 class VortexSystemConfig:
@@ -19,7 +21,7 @@ class VortexSystemConfig:
     poles: tuple[float, float, float] = (-2.0, 0.0, 2.0)
     strengths: tuple[float, float, float] = (1.0, -1.0, 1.0)
     eps: float = 1e-3
-    control_gain_x: float = 0.05
+    control_gain_x: float = 0.1
     control_gain_y: float = 0.5
     diffusion: float = 0.0
 
@@ -33,12 +35,18 @@ def controlled_vortex_drift(
 
     Args:
         x: State tensor ``(batch, 2)``.
-        u: Control tensor ``(batch, 1)``.
+        u: Control tensor ``(batch, 2)`` (or a broadcastable scalar / ``(batch, 1)``).
         config: System parameters.
 
     Returns:
         Drift ``(batch, 2)``.
     """
+    x = x.reshape(-1, 2)
+    u = u.reshape(-1, VORTEX_CONTROL_DIM)
+    if u.shape[0] == 1 and x.shape[0] > 1:
+        u = u.expand(x.shape[0], VORTEX_CONTROL_DIM)
+    u = u.to(dtype=x.dtype, device=x.device)
+
     poles = torch.tensor(config.poles, dtype=x.dtype, device=x.device)
     strengths = torch.tensor(config.strengths, dtype=x.dtype, device=x.device)
 
@@ -49,8 +57,10 @@ def controlled_vortex_drift(
     base_x = config.background_speed + torch.sum(strengths * (2.0 * y) / r2, dim=-1, keepdim=True)
     base_y = torch.sum(-strengths * (2.0 * dx) / r2, dim=-1, keepdim=True)
 
-    drift_x = base_x + config.control_gain_x * u
-    drift_y = base_y + config.control_gain_y * u
+    u_effect = torch.sin(x[:, 0:1]) * u
+
+    drift_x = base_x + config.control_gain_x * u_effect[:, 0:1]
+    drift_y = base_y + config.control_gain_y * u_effect[:, 1:2]
     return torch.cat((drift_x, drift_y), dim=-1)
 
 
@@ -58,7 +68,7 @@ class VortexSDE(ControlledSDE):
     """``torchsde``-compatible wrapper for the real controlled vortex system."""
 
     def __init__(self, config: VortexSystemConfig) -> None:
-        super().__init__(control_dim=1)
+        super().__init__(control_dim=VORTEX_CONTROL_DIM)
         self.config = config
 
     def f(self, t: Tensor, y: Tensor) -> Tensor:
@@ -82,7 +92,7 @@ def vortex_vector_field(
     xlim: tuple[float, float],
     ylim: tuple[float, float],
     grid_size: int = 220,
-    control_u: float = 0.0,
+    control_u: float | tuple[float, float] = 0.0,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Evaluate the vortex drift on a regular grid (for stream / quiver plots).
 
@@ -97,7 +107,11 @@ def vortex_vector_field(
         np.stack((x_grid.ravel(), y_grid.ravel()), axis=-1),
         dtype=torch.float32,
     )
-    controls = torch.full((points.shape[0], 1), control_u)
+    if isinstance(control_u, tuple):
+        control_vec = torch.tensor(control_u, dtype=torch.float32)
+    else:
+        control_vec = torch.full((VORTEX_CONTROL_DIM,), float(control_u), dtype=torch.float32)
+    controls = control_vec.unsqueeze(0).expand(points.shape[0], -1)
 
     drift = controlled_vortex_drift(points, controls, config).numpy()
     u_field = drift[:, 0].reshape(grid_size, grid_size)

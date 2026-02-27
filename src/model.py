@@ -34,24 +34,29 @@ class ControlledNeuralSDE(ControlledSDE):
     def __init__(
         self,
         state_dim: int = 2,
-        control_dim: int = 1,
+        control_dim: int = 2,
         hidden_dim: int = 64,
+        num_layers: int = 2,
     ) -> None:
         super().__init__(control_dim=control_dim)
         self.state_dim = state_dim
+        self.hidden_dim = hidden_dim
+        self.num_layers = num_layers
 
         in_dim = state_dim + 1  # state + time
-        self.drift_net = nn.Sequential(
-            nn.Linear(in_dim, hidden_dim),
-            nn.Tanh(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.Tanh(),
-            nn.Linear(hidden_dim, state_dim),
-        )
+        layers: list[nn.Module] = [nn.Linear(in_dim, hidden_dim), nn.Tanh()]
+        for _ in range(num_layers - 1):
+            layers.extend([nn.Linear(hidden_dim, hidden_dim), nn.Tanh()])
+        layers.append(nn.Linear(hidden_dim, state_dim))
+        self.drift_net = nn.Sequential(*layers)
 
         control_matrix = torch.zeros((state_dim, control_dim), dtype=torch.float32)
-        if state_dim >= 2 and control_dim >= 1:
+        if state_dim >= 2 and control_dim == 1:
+            # Legacy scalar-control fallback.
             control_matrix[1, 0] = 1.0
+        else:
+            for idx in range(min(state_dim, control_dim)):
+                control_matrix[idx, idx] = 1.0
         self.register_buffer("control_matrix", control_matrix)
 
         self._control_fn: ControlFn = lambda t, x: torch.zeros(
@@ -64,20 +69,23 @@ class ControlledNeuralSDE(ControlledSDE):
     def _lookup_control(self, t: Tensor, y: Tensor) -> Tensor:
         """Zero-order hold with fallback to the callable control function."""
         if self._control_times is None or self._control_values is None:
-            return self._control_fn(t, y)
+            u = self._control_fn(t, y)
+            return u.reshape(y.shape[0], self.control_dim)
         return super()._lookup_control(t, y)
 
     def _prepare_features(self, t: Tensor, y: Tensor) -> Tensor:
-        if t.ndim == 0:
-            t = t.expand(y.shape[0])
-        return torch.cat((y, t.to(device=y.device, dtype=y.dtype).unsqueeze(-1)), dim=-1)
+        time = t.to(device=y.device, dtype=y.dtype).reshape(-1, 1)
+        if time.shape[0] == 1:
+            time = time.expand(y.shape[0], 1)
+        return torch.cat((y, time), dim=-1)
 
     def drift_with_control(self, t: Tensor, y: Tensor, u: Tensor) -> Tensor:
-        """Compute the drift: neural_net(y, t) + B @ u."""
+        """Compute the drift: neural_net(y, t) + B @ sin(u)."""
         base_drift = self.drift_net(self._prepare_features(t, y))
-        if u.ndim == 1:
-            u = u.unsqueeze(-1)
-        control_term = u @ self.control_matrix.T.to(dtype=y.dtype, device=y.device)
+        u = u.reshape(-1, self.control_dim)
+        if u.shape[0] == 1 and y.shape[0] > 1:
+            u = u.expand(y.shape[0], self.control_dim)
+        control_term = torch.sin(u) @ self.control_matrix.T.to(dtype=y.dtype, device=y.device)
         return base_drift + control_term
 
     def f(self, t: Tensor, y: Tensor) -> Tensor:
@@ -191,7 +199,8 @@ def save_checkpoint(
         "model_config": {
             "state_dim": model.state_dim,
             "control_dim": model.control_dim,
-            "hidden_dim": int(model.drift_net[0].out_features),
+            "hidden_dim": model.hidden_dim,
+            "num_layers": model.num_layers,
         },
         "training_config": asdict(training_config),
         "loss_history": history,
@@ -207,14 +216,12 @@ def load_checkpoint(
 ) -> tuple[ControlledNeuralSDE, dict[str, object]]:
     """Load a model from a checkpoint file."""
     payload = torch.load(Path(path), map_location=device, weights_only=False)
-    if not isinstance(payload, dict) or "state_dict" not in payload:
-        raise TypeError(f"Unsupported checkpoint format in {path}")
-
     cfg = payload["model_config"]
     model = ControlledNeuralSDE(
         state_dim=int(cfg["state_dim"]),
         control_dim=int(cfg["control_dim"]),
         hidden_dim=int(cfg["hidden_dim"]),
+        num_layers=int(cfg["num_layers"]),
     )
     # strict=False: ignore legacy keys (e.g. diffusion_net) from older checkpoints
     model.load_state_dict(payload["state_dict"], strict=False)

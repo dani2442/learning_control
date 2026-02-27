@@ -11,6 +11,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from src.control import OptimalControlConfig
 from src.dataset import add_control_type_to_path
 
 
@@ -19,6 +20,24 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--control-type", choices=("constant", "sinusoidal"), default="constant")
     p.add_argument("--dataset", type=str, default="data/controlled_vortex.pt")
     p.add_argument("--checkpoint", type=str, default="data/neural_sde.pt")
+    p.add_argument("--num-trajectories", type=int, default=32)
+    p.add_argument(
+        "--dataset-horizon",
+        "--horizon",
+        dest="dataset_horizon",
+        type=float,
+        default=4.0,
+    )
+    p.add_argument(
+        "--dataset-dt",
+        "--dt",
+        dest="dataset_dt",
+        type=float,
+        default=0.05,
+    )
+    p.add_argument("--seed", type=int, default=7)
+    p.add_argument("--control-horizon-time", type=float, default=OptimalControlConfig.horizon_time)
+    p.add_argument("--control-horizon-steps", type=int, default=OptimalControlConfig.horizon_steps)
     p.add_argument("--image-dir", type=str, default="images")
     return p.parse_args()
 
@@ -37,7 +56,11 @@ def main() -> None:
     _run(
         "generate_data.py",
         "--control-type", args.control_type,
-        "--output", args.dataset,
+        "--dataset", args.dataset,
+        "--num-trajectories", str(args.num_trajectories),
+        "--dataset-horizon", str(args.dataset_horizon),
+        "--dataset-dt", str(args.dataset_dt),
+        "--seed", str(args.seed),
         "--image-dir", args.image_dir,
     )
     _run(
@@ -51,6 +74,8 @@ def main() -> None:
         "--mode", "compare",
         "--dataset", str(dataset_path),
         "--checkpoint", args.checkpoint,
+        "--control-horizon-time", str(args.control_horizon_time),
+        "--control-horizon-steps", str(args.control_horizon_steps),
         "--image-dir", args.image_dir,
     )
 

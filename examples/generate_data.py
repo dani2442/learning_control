@@ -7,15 +7,17 @@ import importlib
 import math
 import sys
 from pathlib import Path
-from typing import Callable
-
-from torch import Tensor
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.controls import RandomSinusoidalControlConfig, make_constant_control_fn, make_random_sinusoidal_control_fn
+from src.controls import (
+    ControlFn,
+    RandomSinusoidalControlConfig,
+    make_constant_control_fn,
+    make_random_sinusoidal_control_fn,
+)
 from src.dataset import (
     add_control_type_to_path,
     config_from_payload,
@@ -26,7 +28,7 @@ from src.dataset import (
 from src.visualization import plot_stream_and_trajectories
 
 
-def load_control_fn(spec: str) -> Callable[[Tensor], Tensor | float]:
+def load_control_fn(spec: str) -> ControlFn:
     if ":" not in spec:
         raise ValueError("Control function must be provided as 'module_path:function_name'.")
     module_name, function_name = spec.split(":", maxsplit=1)
@@ -39,10 +41,31 @@ def load_control_fn(spec: str) -> Callable[[Tensor], Tensor | float]:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generate controlled trajectory dataset.")
-    parser.add_argument("--output", type=str, default="data/controlled_vortex.pt")
+    parser.add_argument(
+        "--dataset",
+        "--output",
+        dest="dataset",
+        type=str,
+        default="data/controlled_vortex.pt",
+        help="Output dataset path.",
+    )
     parser.add_argument("--num-trajectories", type=int, default=32)
-    parser.add_argument("--horizon", type=float, default=4.0)
-    parser.add_argument("--dt", type=float, default=0.05)
+    parser.add_argument(
+        "--dataset-horizon",
+        "--horizon",
+        dest="dataset_horizon",
+        type=float,
+        default=4.0,
+        help="Dataset trajectory duration in seconds.",
+    )
+    parser.add_argument(
+        "--dataset-dt",
+        "--dt",
+        dest="dataset_dt",
+        type=float,
+        default=0.05,
+        help="Dataset time spacing used for generated trajectories.",
+    )
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument(
         "--control-type",
@@ -54,12 +77,18 @@ def parse_args() -> argparse.Namespace:
         "--control-fn",
         type=str,
         default=None,
-        help="Custom control callable as 'module_path:function_name' with signature u_control(t).",
+        help="Custom control callable as 'module_path:function_name' with signature u_control(t, x).",
     )
     parser.add_argument("--sin-amplitude", type=float, default=0.6)
     parser.add_argument("--sin-freq-range", type=float, nargs=2, default=(0.4, 2.0))
     parser.add_argument("--sin-phase-range", type=float, nargs=2, default=(0.0, 2.0 * math.pi))
     parser.add_argument("--sin-bias", type=float, default=0.0)
+    parser.add_argument(
+        "--pole-exclusion-radius",
+        type=float,
+        default=0.0,
+        help="Reject initial states within this radius of any pole (set 0 to disable).",
+    )
     parser.add_argument(
         "--constant-value",
         type=float,
@@ -67,12 +96,8 @@ def parse_args() -> argparse.Namespace:
         default=[0.0, 1.0],
         help="One or more constant control values. If multiple are provided, one is sampled per trajectory.",
     )
-    parser.add_argument("--plot", dest="plot", action="store_true")
-    parser.add_argument("--no-plot", dest="plot", action="store_false")
-    parser.set_defaults(plot=True)
-    parser.add_argument("--show-plot", dest="show_plot", action="store_true")
-    parser.add_argument("--no-show-plot", dest="show_plot", action="store_false")
-    parser.set_defaults(show_plot=False)
+    parser.add_argument("--plot", dest="plot", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--show-plot", dest="show_plot", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--max-lines", type=int, default=60)
     parser.add_argument("--image-dir", type=str, default="images")
     return parser.parse_args()
@@ -107,14 +132,15 @@ def main() -> None:
 
     payload = generate_dataset(
         num_trajectories=args.num_trajectories,
-        horizon=args.horizon,
-        dt=args.dt,
+        horizon=args.dataset_horizon,
+        dt=args.dataset_dt,
+        pole_exclusion_radius=args.pole_exclusion_radius,
         seed=args.seed,
         control_fn=control_fn,
     )
     payload["control"] = control_meta
     control_type = control_type_from_payload(payload, default=args.control_type)
-    output_path = add_control_type_to_path(args.output, control_type)
+    output_path = add_control_type_to_path(args.dataset, control_type)
     save_dataset(payload, output_path)
 
     states = payload["states"]

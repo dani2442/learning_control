@@ -97,10 +97,15 @@ class ControlledSDE(nn.Module):
                 device=y.device,
                 dtype=y.dtype,
             )
-        return zero_order_hold(
+        u = zero_order_hold(
             self._control_times, self._control_values, t,
             device=y.device, dtype=y.dtype,
         )
+        if u.ndim == 1:
+            u = u.unsqueeze(0)
+        if u.shape[0] == 1 and y.shape[0] > 1:
+            u = u.expand(y.shape[0], self.control_dim)
+        return u.reshape(y.shape[0], self.control_dim)
 
     # -- SDE interface (subclasses must override) --
 
